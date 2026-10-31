@@ -1,44 +1,9 @@
 #include <mktpack/storage.hpp>
-#include <sqlite3.h>
+#include "database.hpp"
 #include <algorithm>
 
 namespace mktpack {
-namespace {
-struct Database {
-    sqlite3* db=nullptr;
-    std::filesystem::path root;
-    explicit Database(std::filesystem::path path) {
-        if (std::filesystem::is_directory(path)) {
-            root=path;
-            path/="mkt.sqlite";
-        } else {
-            root=path.parent_path();
-        }
-        if (sqlite3_open_v2(path.c_str(),&db,SQLITE_OPEN_READONLY,nullptr)!=SQLITE_OK) {
-            throw std::runtime_error("无法读取索引");
-        }
-    }
-    ~Database() { sqlite3_close(db); }
-};
-
-struct Statement {
-    sqlite3_stmt* statement=nullptr;
-    Statement(Database& database, const char* sql) {
-        if (sqlite3_prepare_v2(database.db,sql,-1,&statement,nullptr)!=SQLITE_OK) {
-            throw std::runtime_error(sqlite3_errmsg(database.db));
-        }
-    }
-    ~Statement() { sqlite3_finalize(statement); }
-    void text(int index, const std::string& value) {
-        sqlite3_bind_text(statement,index,value.c_str(),-1,SQLITE_TRANSIENT);
-    }
-    bool next() { return sqlite3_step(statement)==SQLITE_ROW; }
-    std::string text(int index) {
-        const auto value=sqlite3_column_text(statement,index);
-        return value?(const char*)value:"";
-    }
-};
-}
+using namespace storage;
 
 Json describe(const std::filesystem::path& root, const std::string& group) {
     Database database(root);
@@ -90,7 +55,8 @@ Json ordinary(const std::filesystem::path& root, const std::string& group) {
 std::vector<Table> query(const std::filesystem::path& root, const std::string& group,
                          const std::vector<std::string>& symbols, int64_t start, int64_t end) {
     Database database(root);
-    Statement files(database,"SELECT symbol,path FROM __timefile__ WHERE group_name=? "
+    PayloadReader reader(database);
+    Statement files(database,"SELECT symbol,path,rowid FROM __timefile__ WHERE group_name=? "
                              "AND first_time<? AND last_time>=? ORDER BY symbol,first_time,path");
     files.text(1,group);
     sqlite3_bind_int64(files.statement,2,end);
@@ -99,18 +65,34 @@ std::vector<Table> query(const std::filesystem::path& root, const std::string& g
     while (files.next()) {
         const auto symbol=files.text(0);
         if (!symbols.empty() && std::find(symbols.begin(),symbols.end(),symbol)==symbols.end()) continue;
-        auto table=read(database.root/files.text(1));
-        const auto& time=table.columns.at("time");
-        const auto first=std::lower_bound(time.begin(),time.end(),start)-time.begin();
-        const auto last=std::lower_bound(time.begin(),time.end(),end)-time.begin();
-        if (first==last) continue;
-        for (auto& [name,values]:table.columns) {
-            values=std::vector<int64_t>(values.begin()+first,values.begin()+last);
-        }
+        auto table=decode(reader.read(files.integer(2),files.text(1)));
+        slice(table,start,end);
+        if (table.columns.at("time").empty()) continue;
         grouped[symbol].push_back(std::move(table));
     }
     std::vector<Table> result;
     for (const auto& [symbol,tables]:grouped) result.push_back(merge(tables));
     return result;
+}
+
+Json check_dataset(const std::filesystem::path& root) {
+    Database database(root);
+    PayloadReader reader(database);
+    Statement files(database,"SELECT rowid,path,first_time,last_time,rows FROM __timefile__ ORDER BY rowid");
+    Json errors=Json::array();
+    size_t count=0;
+    while (files.next()) {
+        const auto path=files.text(1);
+        try {
+            const auto table=decode(reader.read(files.integer(0),path));
+            const auto& time=table.columns.at("time");
+            if (time.empty() || time.front()!=files.integer(2) || time.back()!=files.integer(3)
+                || time.size()!=size_t(files.integer(4))) errors.push_back(path);
+        } catch (const std::exception& error) {
+            errors.push_back(path+": "+error.what());
+        }
+        ++count;
+    }
+    return {{"files",count},{"errors",errors}};
 }
 }

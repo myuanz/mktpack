@@ -62,10 +62,10 @@ int main() {
     bool failed=false;
     try { download(options); } catch(const std::exception&) { failed=true; }
     expect(failed,"模拟失败未返回错误");
-    { DB db(root/"mkt.sqlite"); expect(!db.has(month),"失败状态未记录"); }
+    { DB db(root/"mkt.sqlite"); expect(!db.completed(month,false),"失败状态未记录"); }
     responses[host+month]=zipped("1704067200000,1,3,1,2,10,0,0,0,4,0,0\n");
     download(options);
-    { DB db(root/"mkt.sqlite"); expect(db.has(month),"失败重试未成功"); }
+    { DB db(root/"mkt.sqlite"); expect(db.completed(month,false),"失败重试未成功"); }
     auto description=mktpack::describe(root,"kline");
     expect(description["schema"]["close"]["scale"]==1,"组精度发生降低");
     const auto february=monthly+"BTCUSDT-1m-2024-02.zip";
@@ -77,7 +77,7 @@ int main() {
     fs::remove(annual);
     options.end=timestamp("2024-02-01");
     download(options);
-    { DB db(root/"mkt.sqlite"); expect(!db.has(february),"缺失年文件其他来源未失效"); }
+    { DB db(root/"mkt.sqlite"); expect(!db.completed(february,false),"缺失年文件其他来源未失效"); }
     options.full=false;
     options.start=timestamp("2024-02-01");
     options.end=timestamp("2024-03-01");

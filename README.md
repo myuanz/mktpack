@@ -13,11 +13,11 @@ just test
 ## 下载与读取
 
 ```sh
-uv run mkt --root data/binance binance download \
+build/cli/mkt --root data/binance binance download \
   --symbols BTCUSDT DOGEUSDT ETHUSDT BNBUSDT \
   --start 2024-01-01 --end 2026-10-22 \
   --source-cache validation/source/binance --jobs 4
-uv run mkt --root data/binance binance check
+build/cli/mkt --root data/binance binance check
 ```
 
 ```python
@@ -33,4 +33,14 @@ info: dict = market['exchangeinfo']
 
 时间范围为 UTC `[start,end)`，定点数返回 Arrow decimal。币安下载默认将主动买量占比按 0.1 个百分点量化，添加 `--no-lossy-taker` 使用无损编码。`--full` 检查来源对应的本地载荷并补齐缺失数据。
 
-[需求](docs/需求.md) · [格式规范](docs/规范.md) · [真实数据验收](validation/验收.md)
+## 打包
+
+```sh
+build/cli/mkt --root data/binance package packaged-data --max-file-size 128MiB
+```
+
+可用 `--groups`、`--symbols`、`--start`、`--end` 筛选；普通表随索引保留。单个年度载荷放不下时需调大分卷上限.
+
+所有接受普通数据目录的地方都接受打包结果
+
+[需求](docs/需求.md) · [格式规范](docs/规范.md)

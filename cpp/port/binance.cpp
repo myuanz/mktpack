@@ -54,7 +54,6 @@ struct DB {
         }
         return ready;
     }
-    bool has(const std::string& key) { return completed(key,false); }
 };
 std::vector<std::string> list(const std::string& prefix) {
     std::vector<std::string> result;
@@ -395,6 +394,11 @@ void download(const Options& options) {
     fs::create_directories(options.root);
     {
         DB db(options.root/"mkt.sqlite");
+        sqlite3_stmt* packed=nullptr;
+        sqlite3_prepare_v2(db.db,"SELECT 1 FROM sqlite_master WHERE type='table' AND name='__blob__'",-1,&packed,nullptr);
+        const bool is_packed=sqlite3_step(packed)==SQLITE_ROW;
+        sqlite3_finalize(packed);
+        if (is_packed) throw std::runtime_error("打包数据集不支持下载写入，请使用分散目录");
         db.exec("PRAGMA journal_mode=WAL;"
                 "CREATE TABLE IF NOT EXISTS __group__(name TEXT PRIMARY KEY,kind TEXT);"
                 "CREATE TABLE IF NOT EXISTS __col__(group_name TEXT,name TEXT,schema TEXT,PRIMARY KEY(group_name,name));"
@@ -457,26 +461,4 @@ void download(const Options& options) {
     }
 }
 
-Json check(const fs::path& root) {
-    DB db(root/"mkt.sqlite");
-    sqlite3_stmt* statement;
-    sqlite3_prepare_v2(db.db,"SELECT path,first_time,last_time,rows FROM __timefile__",-1,&statement,nullptr);
-    Json errors=Json::array();
-    size_t count=0;
-    while (sqlite3_step(statement)==SQLITE_ROW) {
-        const std::string path=(const char*)sqlite3_column_text(statement,0);
-        try {
-            const auto table=read(root/path);
-            const auto& time=table.columns.at("time");
-            if (time.empty() || time.front()!=sqlite3_column_int64(statement,1)
-                || time.back()!=sqlite3_column_int64(statement,2)
-                || time.size()!=size_t(sqlite3_column_int64(statement,3))) errors.push_back(path);
-        } catch (const std::exception& error) {
-            errors.push_back(path+": "+error.what());
-        }
-        ++count;
-    }
-    sqlite3_finalize(statement);
-    return {{"files",count},{"errors",errors}};
-}
 }

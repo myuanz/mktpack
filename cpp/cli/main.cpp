@@ -1,7 +1,22 @@
 #include <mktpack/binance.hpp>
+#include <mktpack/storage.hpp>
 #include <CLI/CLI.hpp>
 #include <chrono>
 #include <iostream>
+
+namespace {
+uint64_t file_size(const std::string& text) {
+    if (text.empty() || text.front()<'0' || text.front()>'9') throw std::runtime_error("分卷大小格式错误");
+    size_t used=0;
+    const auto value=std::stoull(text,&used);
+    const auto unit=text.substr(used);
+    const std::map<std::string,uint64_t> factors={{"",1},{"B",1},{"KiB",1024},{"MiB",1024*1024},
+        {"GiB",1024ULL*1024*1024},{"KB",1000},{"MB",1000000},{"GB",1000000000}};
+    if (!factors.contains(unit) || !value || value>UINT64_MAX/factors.at(unit))
+        throw std::runtime_error("分卷大小应为正整数，可带 B、KiB、MiB、GiB、KB、MB、GB");
+    return value*factors.at(unit);
+}
+}
 
 int main(int argc, char** argv) {
     CLI::App app{"MTKPack"};
@@ -22,6 +37,15 @@ int main(int argc, char** argv) {
     download->add_flag("--lossy-taker,!--no-lossy-taker", options.lossy_taker,
                        "主动买量按0.1个百分点量化（默认启用）");
     auto check=binance->add_subcommand("check");
+    auto packing=app.add_subcommand("package","打包为 SQLite 载荷分卷");
+    std::string destination, maximum="128MiB", package_start, package_end;
+    mktpack::PackageOptions package_options;
+    packing->add_option("destination",destination)->required();
+    packing->add_option("--max-file-size",maximum,"每个分卷的实际文件大小上限");
+    packing->add_option("--groups",package_options.groups)->expected(-1);
+    packing->add_option("--symbols",package_options.symbols)->expected(-1);
+    packing->add_option("--start",package_start);
+    packing->add_option("--end",package_end);
     try {
         app.parse(argc, argv);
         if (*info) {
@@ -35,8 +59,16 @@ int main(int argc, char** argv) {
                 : mktpack::binance::timestamp(end);
             if (options.start>options.end) throw std::runtime_error("start 晚于 end");
             mktpack::binance::download(options);
+        } else if (*packing) {
+            package_options.max_file_size=file_size(maximum);
+            if (!package_start.empty()) package_options.start=mktpack::binance::timestamp(package_start);
+            if (!package_end.empty()) package_options.end=mktpack::binance::timestamp(package_end);
+            package_options.progress=[](const auto& message) { std::cerr<<message<<"\n"; };
+            const auto result=mktpack::package(root,destination,package_options);
+            for (const auto& warning:result.at("warnings")) std::cerr<<"警告："<<warning.get<std::string>()<<"\n";
+            std::cout<<result.dump(2)<<"\n";
         } else if (*check) {
-            auto result=mktpack::binance::check(root);
+            auto result=mktpack::check_dataset(root);
             std::cout << result.dump(2) << "\n";
             return result["errors"].empty()?0:1;
         } else {

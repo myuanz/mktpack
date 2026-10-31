@@ -259,6 +259,7 @@ Table decode(const Bytes& bytes) {
     }
     return table;
 }
+Json info(const std::vector<uint8_t>& bytes) { return header(bytes).first; }
 Json info(const std::filesystem::path& path) {
     std::ifstream input(path,std::ios::binary);
     Bytes bytes(12);

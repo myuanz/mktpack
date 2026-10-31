@@ -11,9 +11,9 @@ MktPack 是金融时序数据格式与读写库，包名为 `mktpack`，CLI 为 
 - `cpp/port`：数据源适配器，币安下载及字段映射放在 `binance.cpp`
 - `cpp/cli`：命令参数和终端进度；`cpp/bindings`、`python/mktpack`：薄绑定与 Arrow 包装
 - `tests`：自动测试；`validation`：只读真实样本和验收记录
-- `py`：数据准备与独立验收工具，使用自己的 `pyproject.toml` 和 `uv.lock`
 
-通用存储调用核心，适配器调用存储。主要功能使用 C++20，交接层以外的 C++ 不依赖 Python；Python 模块不包含下载器逻辑。
+通用存储调用核心，适配器调用存储。所有 CLI 均由原生 C++ 执行，交接层以外的 C++ 不依赖 Python。Python 仅负责 wheel 分发、数据读取与 Arrow table 包装、raw 接口。
+开发阶段直接修改接口，不保留兼容转发或旧入口别名。
 
 ## 构建与开发命令
 
@@ -28,8 +28,7 @@ MktPack 是金融时序数据格式与读写库，包名为 `mktpack`，CLI 为 
 | `uv run pytest -q` | 运行 Python 接口测试 |
 | `uv build` | 构建本地分发包 |
 
-本地检查示例：`uv run mkt --root data/binance binance check`。
-验收工具使用 `uv run --directory py -m audit_compression` 等模块入口。
+本地检查示例：`mkt --root data/binance binance check`。
 
 ## 编码与命名
 
@@ -42,6 +41,7 @@ MktPack 是金融时序数据格式与读写库，包名为 `mktpack`，CLI 为 
 采用 CTest 和 pytest，Python 测试文件命名为 `test_*.py`。按改动覆盖精确数值往返、最高小数精度合并、时间区间 `[start,end)`、重复时间顺序，以及目录与打包结果的一致性。下载测试覆盖增量跳过与全量补齐。
 
 真实样本保持只读，验收记录来源、字段映射、行数、体积和耗时。生成数据放入已忽略的 `validation/generated/` 或 `validation/output/`。运行受影响的测试并报告结果。
+持续验证写入 `tests/`
 
 ## 提交与拉取请求
 
