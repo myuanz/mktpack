@@ -1,0 +1,32 @@
+[build-system]
+requires = ["scikit-build-core>=0.11", "nanobind>=3"]
+build-backend = "scikit_build_core.build"
+[project]
+name = "mktpack"
+version = "0.1.0"
+description = "精确金融时序数据格式与读写库"
+requires-python = ">=3.12"
+dependencies = ["pyarrow>=20", "numpy>=2"]
+[dependency-groups]
+dev = ["pytest>=8"]
+[tool.scikit-build]
+wheel.packages = ["python/mktpack"]
+wheel.py-api = "cp312"
+cmake.build-type = "Release"
+build-dir = "build/{wheel_tag}"
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.cibuildwheel]
+build = "cp312-manylinux_*"
+skip = "cp3*t-*"
+archs = ["native"]
+build-frontend = "build[uv]"
+test-requires = ["pytest>=8"]
+test-command = "python -m pytest -q {project}/tests"
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+environment-pass = ["CPM_SOURCE_CACHE"]
+environment = { CPM_SOURCE_CACHE = "/host$CPM_SOURCE_CACHE", CMAKE_BUILD_PARALLEL_LEVEL = "4" }

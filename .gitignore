@@ -1,4 +1,4 @@
-/.venv/
+.venv/
 /build/
 /dist/
 *.egg-info/
@@ -10,3 +10,5 @@ validation/output/
 
 /data
 /converted-data
+
+验收.md
