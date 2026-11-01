@@ -1,6 +1,7 @@
 #include <mktpack/storage.hpp>
-#include "database.hpp"
+#include "sqlite.hpp"
 #include <chrono>
+#include <cstdio>
 #include <set>
 #include <tuple>
 
@@ -10,7 +11,7 @@ using namespace storage;
 namespace fs=std::filesystem;
 using namespace std::chrono;
 struct File {
-    int64_t id, first, last;
+    int64_t id, first, last, volume;
     std::string path;
 };
 struct Bucket {
@@ -43,35 +44,40 @@ public:
         bytes+=database_size(*current);
         current.reset();
     }
-    std::string append(int64_t id,const std::vector<uint8_t>& payload,const std::string& label) {
+    int64_t append_entry(const std::string& label,const std::function<void(Database&)>& write) {
         for (;;) {
             if (!current) {
                 ++count;
                 current=std::make_unique<Database>(root/("mkt.data."+std::to_string(count)),SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
-                current->exec("PRAGMA journal_mode=DELETE; CREATE TABLE blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
+                current->exec("PRAGMA journal_mode=DELETE");
                 entries=0;
             }
             current->exec("BEGIN");
-            {
-                Statement insert(*current,"INSERT INTO blob(id,bytes) VALUES(?,?)");
-                insert.integer(1,id);
-                if (sqlite3_bind_blob64(insert.statement,2,payload.data(),payload.size(),SQLITE_TRANSIENT)!=SQLITE_OK)
-                    throw std::runtime_error(sqlite3_errmsg(current->db));
-                insert.next();
-            }
+            write(*current);
             const auto size=database_size(*current);
             if (size<=limit) {
                 current->exec("COMMIT");
                 ++entries;
-                return current->path.filename().string();
+                return count;
             }
             current->exec("ROLLBACK");
             if (!entries)
-                throw std::runtime_error(label+" 的年度载荷需要至少 "+std::to_string(size)+
+                throw std::runtime_error(label+"需要至少 "+std::to_string(size)+
                                          " 字节分卷，超过 --max-file-size="+std::to_string(limit));
             close();
         }
     }
+    int64_t append(int64_t id,const std::vector<uint8_t>& payload,const std::string& label) {
+        return append_entry(label+" 的年度载荷",[&](Database& db) {
+            db.exec("CREATE TABLE IF NOT EXISTS blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
+            Statement insert(db,"INSERT INTO blob(id,bytes) VALUES(?,?)");
+            insert.integer(1,id);
+            if (sqlite3_bind_blob64(insert.statement,2,payload.data(),payload.size(),SQLITE_TRANSIENT)!=SQLITE_OK)
+                throw std::runtime_error(sqlite3_errmsg(db.db));
+            insert.next();
+        });
+    }
+
 };
 
 void copy_index(Database& source,Database& destination) {
@@ -110,14 +116,15 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
     }
     std::map<std::tuple<std::string,std::string,int>,Bucket> buckets;
     {
-        Statement files(input,"SELECT rowid,group_name,symbol,path,first_time,last_time FROM __timefile__ "
-                              "WHERE first_time<? AND last_time>=? ORDER BY group_name,symbol,first_time,path,rowid");
+        Statement files(input,"SELECT f.id,g.name,s.name,g.name||'/'||s.name||'/'||f.name,first_time,last_time,volume "
+                              "FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id "
+                              "WHERE first_time<? AND last_time>=? ORDER BY g.name,s.name,first_time,f.name,f.id");
         files.integer(1,options.end); files.integer(2,options.start);
         while (files.next()) {
             const auto group=files.text(1), symbol=files.text(2);
             if (!selected.contains(group)) continue;
             if (!options.symbols.empty() && std::find(options.symbols.begin(),options.symbols.end(),symbol)==options.symbols.end()) continue;
-            const File file{files.integer(0),files.integer(4),files.integer(5),files.text(3)};
+            const File file{files.integer(0),files.integer(4),files.integer(5),files.integer(6),files.text(3)};
             const auto first=std::max(file.first,options.start), last=std::min(file.last,options.end-1);
             for (int y=year_of(first);y<=year_of(last);++y) {
                 auto& bucket=buckets[{group,symbol,y}];
@@ -136,14 +143,23 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
         {
             Database output(work/"mkt.sqlite",SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
             copy_index(input,output);
-            output.exec("DELETE FROM __timefile__; DROP TABLE IF EXISTS __blob__; "
-                        "CREATE TABLE __blob__(blob_id INTEGER PRIMARY KEY,volume TEXT NOT NULL)");
+            output.exec("DELETE FROM __timefile__; PRAGMA application_id=0x4d4b5450");
             for (const auto& group:excluded) {
-                Statement columns(output,"DELETE FROM __col__ WHERE group_name=?");
-                columns.text(1,group); columns.next();
                 Statement groups(output,"DELETE FROM __group__ WHERE name=?");
                 groups.text(1,group); groups.next();
             }
+            output.exec("DELETE FROM __sqlite_partitions__");
+            // 外置普通数据库完整携带，与容量分卷独立
+            uint64_t ordinary_bytes=0;
+            Statement ordinary(input,"SELECT DISTINCT location FROM __group__ WHERE kind='ordinary' AND location<>''");
+            while(ordinary.next()) {
+                const auto location=ordinary.text(0);
+                fs::create_directories((work/location).parent_path());
+                Database src(input.root/location),dst(work/location,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
+                copy_index(src,dst);
+                ordinary_bytes+=database_size(dst);
+            }
+            int64_t sqlite_rows=0;
             Volumes volumes(work,options.max_file_size);
             std::map<std::pair<std::string,std::string>,Json> schemas;
             int64_t id=0, rows=0;
@@ -155,11 +171,12 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
                 const bool copy=bucket.files.size()==1 && bucket.files[0].first>=bucket.start && bucket.files[0].last<bucket.end;
                 std::vector<uint8_t> payload;
                 if (copy) {
-                    payload=reader.read(bucket.files[0].id,bucket.files[0].path);
+                    const auto& file=bucket.files[0];
+                    payload=reader.read(file.id,file.path,file.volume);
                 } else {
                     std::vector<Table> tables;
                     for (const auto& file:bucket.files) {
-                        auto table=decode(reader.read(file.id,file.path));
+                        auto table=decode(reader.read(file.id,file.path,file.volume));
                         slice(table,bucket.start,bucket.end);
                         if (!table.columns.at("time").empty()) tables.push_back(std::move(table));
                     }
@@ -180,19 +197,18 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
                 }
                 const auto header=info(payload);
                 const auto volume=volumes.append(++id,payload,label);
-                Statement file(output,"INSERT INTO __timefile__(rowid,group_name,symbol,path,first_time,last_time,rows) VALUES(?,?,?,?,?,?,?)");
-                file.integer(1,id); file.text(2,group); file.text(3,symbol); file.text(4,label);
+                Statement file(output,"INSERT INTO __timefile__(id,group_id,symbol_id,name,first_time,last_time,rows,volume) VALUES(?,?,?,?,?,?,?,?)");
+                file.integer(1,id); file.integer(2,group_id(output,group)); file.integer(3,symbol_id(output,symbol)); file.text(4,std::to_string(y)+".mkp");
                 file.integer(5,header.at("first_time")); file.integer(6,header.at("last_time")); file.integer(7,header.at("rows"));
+                file.integer(8,volume);
                 file.next();
-                Statement mapping(output,"INSERT INTO __blob__(blob_id,volume) VALUES(?,?)");
-                mapping.integer(1,id); mapping.text(2,volume); mapping.next();
                 for (const auto& descriptor:header.at("columns")) {
                     const auto name=descriptor.at("name").get<std::string>();
                     auto& schema=schemas[{group,name}];
                     if (schema.is_null()) {
-                        Statement original(input,"SELECT schema FROM __col__ WHERE group_name=? AND name=?");
-                        original.text(1,group); original.text(2,name);
-                        schema=original.next()?Json::parse(original.text(0)):Json::object();
+                        Statement original(input,"SELECT schema FROM __group__ WHERE name=?");
+                        original.text(1,group);
+                        schema=original.next()?Json::parse(original.text(0)).value(name,Json::object()):Json::object();
                         schema["scale"]=descriptor.value("scale",0);
                     } else schema["scale"]=std::max(schema.value("scale",0),descriptor.value("scale",0));
                     schema["type"]=descriptor.at("type");
@@ -200,22 +216,57 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
                 rows+=header.at("rows").get<int64_t>();
                 const std::string kind=copy?"copied":"reencoded";
                 result[kind]=result[kind].get<size_t>()+1;
-                if (options.progress) options.progress(label+" "+(copy?"复制":"合并编码")+" → "+volume+
+                if (options.progress) options.progress(label+" "+(copy?"复制":"合并编码")+" → mkt.data."+std::to_string(volume)+
                     " ("+std::to_string(++processed)+"/"+std::to_string(buckets.size())+")");
             }
-            for (const auto& [key,schema]:schemas) {
-                Statement update(output,"UPDATE __col__ SET schema=? WHERE group_name=? AND name=?");
-                update.text(1,schema.dump()); update.text(2,key.first); update.text(3,key.second); update.next();
+            std::map<std::string,Json> group_schemas;
+            for (const auto& [key,schema]:schemas) group_schemas[key.first][key.second]=schema;
+            for (const auto& [group,schema]:group_schemas) {
+                Statement update(output,"UPDATE __group__ SET schema=? WHERE name=?");
+                update.text(1,schema.dump()); update.text(2,group); update.next();
             }
+            for(const auto& name:selected) {
+                const auto spec=group_spec(input,name);
+                if(spec.storage!="sqlite") continue;
+                SqlReader reader(input,spec);
+                const auto parts=reader.partitions(options.start,options.end);
+                auto destination_spec=spec;
+                destination_spec.table="data_"+std::to_string(spec.id);
+                Statement update(output,"UPDATE __group__ SET location='',table_name=? WHERE id=?");
+                update.text(1,destination_spec.table); update.integer(2,spec.id); update.next();
+                if(parts.empty()) continue;
+                const auto first=std::max(options.start,parts.front().first),last=std::min(options.end-1,parts.back().last);
+                auto date=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{first}})};
+                auto month=date.year()/date.month();
+                const auto create=reader.create_sql(parts.front().volume,destination_spec.table);
+                for(;;month+=months{1}) {
+                    const auto start=duration_cast<milliseconds>(sys_days{month/1}.time_since_epoch()).count();
+                    if(start>last) break;
+                    const auto end=duration_cast<milliseconds>(sys_days{(month+months{1})/1}.time_since_epoch()).count();
+                    const auto records=reader.read(std::max(start,options.start),std::min(end,options.end),spec.symbol.empty()?std::vector<std::string>{}:options.symbols);
+                    if(records.rows.empty()) continue;
+                    char label[8]; snprintf(label,sizeof label,"%04d-%02u",int(month.year()),unsigned(month.month()));
+                    const auto volume=volumes.append_entry(name+" "+label+" 的整月数据",[&](Database& db) { copy_rows(db,destination_spec,create,records); });
+                    const auto column=std::find(records.columns.begin(),records.columns.end(),spec.time)-records.columns.begin();
+                    int64_t minimum=INT64_MAX,maximum=INT64_MIN;
+                    for(const auto& row:records.rows) { minimum=std::min(minimum,row[column].get<int64_t>());maximum=std::max(maximum,row[column].get<int64_t>()); }
+                    Statement part(output,"INSERT INTO __sqlite_partitions__ VALUES(?,?,?,?,?,?,?)");
+                    part.integer(1,spec.id); part.integer(2,start); part.integer(3,end); part.integer(4,volume);
+                    part.integer(5,records.rows.size()); part.integer(6,minimum); part.integer(7,maximum); part.next();
+                    sqlite_rows+=records.rows.size();
+                    if(options.progress) options.progress(name+" "+label+" → mkt.data."+std::to_string(volume));
+                }
+            }
+            rows+=sqlite_rows;
             output.exec("COMMIT; VACUUM");
             volumes.close();
             const auto index_size=database_size(output);
             if (index_size>options.max_file_size)
                 result["warnings"].push_back("mkt.sqlite 为 "+std::to_string(index_size)+" 字节，超过分卷上限 "+std::to_string(options.max_file_size));
-            result["files"]=id; result["rows"]=rows;
+            result["files"]=id; result["rows"]=rows; result["sqlite_rows"]=sqlite_rows;
             result["volumes"]=volumes.count;
             result["index_bytes"]=index_size;
-            result["bytes"]=index_size+volumes.bytes;
+            result["bytes"]=index_size+volumes.bytes+ordinary_bytes;
         }
         for (const auto& entry:fs::directory_iterator(work)) fs::rename(entry.path(),destination/entry.path().filename());
         fs::remove(work);

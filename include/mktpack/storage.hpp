@@ -5,7 +5,8 @@
 namespace mktpack {
 Json describe(const std::filesystem::path& root,const std::string& group="");
 Json ordinary(const std::filesystem::path& root,const std::string& group);
-std::vector<Table> query(const std::filesystem::path& root,const std::string& group,const std::vector<std::string>& symbols,int64_t start,int64_t end);
+struct ReadTable { Json columns, schema, metadata; };
+std::vector<ReadTable> query(const std::filesystem::path& root,const std::string& group,const std::vector<std::string>& symbols,int64_t start,int64_t end);
 Json check_dataset(const std::filesystem::path& root);
 struct PackageOptions {
     std::vector<std::string> groups, symbols;

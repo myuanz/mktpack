@@ -39,7 +39,7 @@ info: dict = market['exchangeinfo']
 build/cli/mkt --root data/binance package packaged-data --max-file-size 128MiB
 ```
 
-可用 `--groups`、`--symbols`、`--start`、`--end` 筛选；普通表随索引保留。单个年度载荷放不下时需调大分卷上限.
+可用 `--groups`、`--symbols`、`--start`、`--end` 筛选；普通表及其外置数据库完整保留。单个年度 MKP 或整月 SQLite 时序数据放不下时需调大分卷上限。
 
 所有接受普通数据目录的地方都接受打包结果
 

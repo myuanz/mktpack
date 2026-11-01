@@ -52,20 +52,39 @@ def read(path: str | Path) -> pa.Table:
     return _table(*_native.read(str(path)))
 
 
+def _type(spec):
+    kind = spec['type']
+    if kind == 'any':
+        return pa.dense_union([pa.field('null', pa.null()), pa.field('integer', pa.int64()), pa.field('real', pa.float64()), pa.field('string', pa.string()), pa.field('blob', pa.binary())])
+    if kind == 'decimal':
+        return pa.decimal128(38, spec.get('scale', 0))
+    return {'timestamp': pa.timestamp('ms', tz='UTC'), 'integer': pa.int64(),
+            'real': pa.float64(), 'string': pa.string(), 'blob': pa.binary(),
+            'null': pa.null()}[kind]
+
+
 def _table(columns, schema, metadata):
     schema, metadata = json.loads(schema), json.loads(metadata)
     arrays = {}
     for name, values in columns.items():
         spec = schema[name]
-        if spec["type"] == "timestamp":
-            arrays[name] = pa.array(values, type=pa.timestamp("ms", tz="UTC"))
-        elif spec["type"] == "decimal":
-            scale = spec["scale"]
-            arrays[name] = pa.array([Decimal(v).scaleb(-scale) for v in values], type=pa.decimal128(38, scale))
+        if spec['type'] == 'decimal':
+            values = [None if v is None else Decimal(v).scaleb(-spec.get('scale', 0)) for v in values]
+        if spec['type'] == 'any':
+            children = [[] for _ in range(5)]
+            codes, offsets = [], []
+            for value in values:
+                code = {type(None): 0, int: 1, float: 2, str: 3, bytes: 4}[type(value)]
+                codes.append(code)
+                offsets.append(len(children[code]))
+                children[code].append(value)
+            dtype = _type(spec)
+            arrays[name] = pa.UnionArray.from_dense(pa.array(codes, type=pa.int8()), pa.array(offsets, type=pa.int32()),
+                [pa.array(items, type=field.type) for items, field in zip(children, dtype)], field_names=[field.name for field in dtype])
         else:
-            arrays[name] = pa.array(values, type=pa.int64())
-    if metadata.get("symbol"):
-        arrays["symbol"] = pa.array([metadata["symbol"]] * len(next(iter(columns.values()))))
+            arrays[name] = pa.array(values, type=_type(spec))
+    if metadata.get('symbol'):
+        arrays['symbol'] = pa.array([metadata['symbol']] * len(next(iter(columns.values()))))
     return pa.table(arrays)
 
 

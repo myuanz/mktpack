@@ -1,4 +1,5 @@
 #include <mktpack/binance.hpp>
+#include "../storage/sqlite.hpp"
 #include <mktpack/decimal.hpp>
 #include <sqlite3.h>
 #include <miniz.h>
@@ -18,41 +19,162 @@ namespace {
 const std::string host="https://s3-ap-northeast-1.amazonaws.com/data.binance.vision/";
 std::mutex output_mutex;
 std::string quote(const std::string& s){std::string q="'";for(char c:s){q+=c;if(c=='\'')q+=c;}return q+"'";}
-struct DB {
-    sqlite3* db=nullptr;
-    fs::path root;
-    explicit DB(const fs::path& path):root(path.parent_path()) {
-        if (sqlite3_open(path.c_str(),&db)!=SQLITE_OK) throw std::runtime_error("无法打开索引");
-        sqlite3_busy_timeout(db,60000);
+Json funding_schema(int scale) {
+    return {{"time",{{"type","timestamp"},{"scale",0}}},
+            {"symbol",{{"type","string"}}},
+            {"funding_rate",{{"type","decimal"},{"scale",scale},{"scale_column","scale"}}},
+            {"interval_hours",{{"type","integer"},{"scale",0}}}};
+}
+
+void create_funding(storage::Database& db) {
+    db.exec("CREATE TABLE IF NOT EXISTS funding_data.funding_rate_settlement("
+            "symbol_id INTEGER,time INTEGER,funding_rate INTEGER,scale INTEGER,interval_hours INTEGER,"
+            "PRIMARY KEY(symbol_id,time)) WITHOUT ROWID");
+}
+
+// 调用方将分区替换和下载状态更新放在同一事务中
+void write_funding(storage::Database& db,const Table& table,int64_t start,int64_t end) {
+    const auto symbol=storage::symbol_id(db,table.metadata.at("symbol"));
+    storage::Statement remove(db,"DELETE FROM funding_data.funding_rate_settlement WHERE symbol_id=? AND time>=? AND time<?");
+    remove.integer(1,symbol); remove.integer(2,start); remove.integer(3,end); remove.next();
+    const int scale=table.schema.at("funding_rate").value("scale",0);
+    storage::Statement insert(db,"INSERT INTO funding_data.funding_rate_settlement VALUES(?,?,?,?,?)");
+    const auto& time=table.columns.at("time");
+    for (size_t i=0;i<time.size();++i) {
+        insert.integer(1,symbol); insert.integer(2,time[i]);
+        insert.integer(3,table.columns.at("funding_rate")[i]); insert.integer(4,scale);
+        insert.integer(5,table.columns.at("interval_hours")[i]); insert.next();
+        sqlite3_reset(insert.statement);
     }
-    ~DB() { sqlite3_close(db); }
-    void exec(const std::string& sql) {
-        char* error=nullptr;
-        if (sqlite3_exec(db,sql.c_str(),nullptr,nullptr,&error)!=SQLITE_OK) {
-            const std::string message=error;
-            sqlite3_free(error);
-            throw std::runtime_error(message);
+    int highest=scale;
+    {
+        storage::Statement previous(db,"SELECT schema FROM __group__ WHERE name='funding_rate_settlement'");
+        if (previous.next()) {
+            const auto schema=Json::parse(previous.text(0));
+            if (schema.contains("funding_rate")) highest=std::max(highest,schema.at("funding_rate").value("scale",0));
         }
     }
-    bool completed(const std::string& key, bool verify_presence) {
+    storage::Statement group(db,"INSERT INTO __group__(name,kind,storage,location,schema) VALUES('funding_rate_settlement','timeseries','sqlite','funding.sqlite',?) "
+                       "ON CONFLICT(name) DO UPDATE SET schema=excluded.schema,storage=excluded.storage,location=excluded.location");
+    group.text(1,funding_schema(highest).dump()); group.next();
+}
+
+
+struct Source {
+    int64_t id;
+    int period;
+    bool rest=false;
+    bool funding=false;
+    std::string table() const { return rest?"__binance_rest_funding__":"__binance_datavision_files__"; }
+    std::string key() const { return rest?"symbol_id":"template_id"; }
+    std::string condition() const {
+        return key()+"="+std::to_string(id)+" AND period="+std::to_string(period);
+    }
+};
+int period_number(std::string period) {
+    period.erase(std::remove(period.begin(),period.end(),'-'),period.end());
+    return std::stoi(period);
+}
+int64_t path_id(storage::Database& db,const std::string& path) {
+    int64_t parent=0;
+    size_t start=0;
+    do {
+        const auto end=path.find('/',start);
+        const auto name=path.substr(start,end==std::string::npos?end:end-start);
+        storage::Statement insert(db,"INSERT OR IGNORE INTO __binance_datavision_paths__(parent_id,name) VALUES(?,?)");
+        insert.integer(1,parent); insert.text(2,name); insert.next();
+        storage::Statement query(db,"SELECT id FROM __binance_datavision_paths__ WHERE parent_id=? AND name=?");
+        query.integer(1,parent); query.text(2,name); query.next();
+        parent=query.integer(0);
+        if (end==std::string::npos) break;
+        start=end+1;
+    } while (true);
+    return parent;
+}
+
+struct DB:storage::Database {
+    explicit DB(const fs::path& path):Database(path,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE) {
+        if(fs::exists(root/"funding.sqlite")) attach_funding();
+    }
+    void attach_funding() { exec("ATTACH DATABASE "+quote((root/"funding.sqlite").string())+" AS funding_data"); }
+    int64_t file_id(const std::string& group,const std::string& symbol,const std::string& name) {
+        storage::Statement query(*this,"SELECT f.id FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id WHERE g.name=? AND s.name=? AND f.name=?");
+        query.text(1,group); query.text(2,symbol); query.text(3,name); query.next();
+        return query.integer(0);
+    }
+    Source source(const std::string& key,const std::string& group,const std::string& symbol,const std::string& period) {
+        auto pattern=key;
+        pattern.replace(pattern.rfind(period),period.size(),"{period}");
+        for (size_t pos=0;(pos=pattern.find(symbol,pos))!=std::string::npos;pos+=8)
+            pattern.replace(pos,symbol.size(),"{symbol}");
+        const auto path=path_id(*this,pattern);
+        const auto group_key=storage::group_id(*this,group), symbol_key=storage::symbol_id(*this,symbol);
+        storage::Statement insert(*this,"INSERT OR IGNORE INTO __binance_datavision_templates__(path_id,group_id,symbol_id) VALUES(?,?,?)");
+        insert.integer(1,path); insert.integer(2,group_key); insert.integer(3,symbol_key); insert.next();
+        Source result{};
+        {
+            storage::Statement query(*this,"SELECT id FROM __binance_datavision_templates__ WHERE path_id=? AND group_id=? AND symbol_id=?");
+            query.integer(1,path); query.integer(2,group_key); query.integer(3,symbol_key); query.next();
+            result={query.integer(0),period_number(period),false,group=="funding_rate_settlement"};
+        }
+        exec("INSERT OR IGNORE INTO __binance_datavision_files__(template_id,period) VALUES("+
+             std::to_string(result.id)+","+std::to_string(result.period)+")");
+        return result;
+    }
+    Source rest_source(const std::string& symbol,const std::string& period) {
+        Source result{storage::symbol_id(*this,symbol),period_number(period),true,true};
+        exec("INSERT OR IGNORE INTO __binance_rest_funding__(symbol_id,period) VALUES("+
+             std::to_string(result.id)+","+std::to_string(result.period)+")");
+        return result;
+    }
+    void remap_file(int64_t from,int64_t to) {
+        exec("UPDATE __binance_datavision_files__ SET file_id="+std::to_string(to)+" WHERE file_id="+std::to_string(from));
+    }
+    bool completed(const Source& source, bool verify_presence, int64_t required_end=0) {
+        if (source.funding) {
+            storage::Statement state(*this,"SELECT rows,error,"+std::string(source.rest?"covered_until":"0")+
+                " FROM "+source.table()+" WHERE "+source.condition());
+            if (!state.next() || sqlite3_column_type(state.statement,0)==SQLITE_NULL ||
+                sqlite3_column_type(state.statement,1)!=SQLITE_NULL || state.integer(2)<required_end) return false;
+            if (!verify_presence) return true;
+            int64_t symbol=source.id;
+            if (!source.rest) {
+                storage::Statement query(*this,"SELECT symbol_id FROM __binance_datavision_templates__ WHERE id=?");
+                query.integer(1,source.id); query.next(); symbol=query.integer(0);
+            }
+            auto period=std::to_string(source.period);
+            period.insert(4,"-");
+            if (period.size()==9) period.insert(7,"-");
+            const auto begin=timestamp(period.size()==7?period+"-01":period);
+            const auto date=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{begin}})};
+            auto end=duration_cast<milliseconds>((period.size()==7?sys_days{date+months{1}}:sys_days{date}+days{1}).time_since_epoch()).count();
+            if (source.rest) end=std::min(end,state.integer(2));
+            storage::Statement count(*this,"SELECT count(*) FROM funding_rate_settlement WHERE symbol_id=? AND time>=? AND time<?");
+            count.integer(1,symbol); count.integer(2,begin); count.integer(3,end); count.next();
+            return count.integer(0)==state.integer(0);
+        }
         sqlite3_stmt* statement;
-        sqlite3_prepare_v2(db,"SELECT s.success,m.path FROM __binance_download_status__ s "
-                             "LEFT JOIN __binance_file_mapping__ m ON m.key=s.key WHERE s.key=?",
-                           -1,&statement,nullptr);
-        sqlite3_bind_text(statement,1,key.c_str(),-1,SQLITE_TRANSIENT);
-        bool ready=sqlite3_step(statement)==SQLITE_ROW && sqlite3_column_int(statement,0);
-        std::string missing;
+        const auto sql="SELECT s.file_id,s.error,g.name||'/'||t.name||'/'||f.name,"+
+            std::string(source.rest?"s.covered_until":"0")+" FROM "+source.table()+" s "
+            "LEFT JOIN __timefile__ f ON f.id=s.file_id LEFT JOIN __group__ g ON g.id=f.group_id "
+            "LEFT JOIN __symbols__ t ON t.id=f.symbol_id WHERE s."+source.key()+"=? AND s.period=?";
+        sqlite3_prepare_v2(db,sql.c_str(),-1,&statement,nullptr);
+        sqlite3_bind_int64(statement,1,source.id);
+        sqlite3_bind_int(statement,2,source.period);
+        bool ready=sqlite3_step(statement)==SQLITE_ROW && sqlite3_column_type(statement,0)!=SQLITE_NULL
+                   && sqlite3_column_type(statement,1)==SQLITE_NULL;
+        const bool covered=sqlite3_column_int64(statement,3)>=required_end;
+        int64_t missing=0;
         if (ready && verify_presence) {
-            const auto path=sqlite3_column_text(statement,1);
+            const auto path=sqlite3_column_text(statement,2);
             ready=path && fs::exists(root/(const char*)path);
-            if (path && !ready) missing=(const char*)path;
+            if (!ready) missing=sqlite3_column_int64(statement,0);
         }
         sqlite3_finalize(statement);
-        if (!missing.empty()) {
-            exec("UPDATE __binance_download_status__ SET success=0,error='载荷缺失' WHERE key IN "
-                 "(SELECT key FROM __binance_file_mapping__ WHERE path="+quote(missing)+")");
+        if (missing) {
+            exec("UPDATE __binance_datavision_files__ SET error='载荷缺失' WHERE file_id="+std::to_string(missing));
         }
-        return ready;
+        return ready && covered;
     }
 };
 std::vector<std::string> list(const std::string& prefix) {
@@ -168,24 +290,29 @@ Table csv(const std::string& text, const std::string& group, const std::string& 
     return table;
 }
 
-void register_file(DB& db, const fs::path& root, const fs::path& path, const Table& table) {
+void register_file(DB& db, const fs::path& path, const Table& table) {
     const auto& time=table.columns.at("time");
-    const auto relative=fs::relative(path,root).generic_string();
     const auto symbol=table.metadata.at("symbol").get<std::string>();
     const auto group=table.metadata.at("group").get<std::string>();
-    db.exec("INSERT OR REPLACE INTO __group__ VALUES("+quote(group)+",'timeseries')");
     const auto stored=info(path);
+    Json schema=Json::object();
+    {
+        storage::Statement previous(db,"SELECT schema FROM __group__ WHERE name=?");
+        previous.text(1,group);
+        if (previous.next()) schema=Json::parse(previous.text(0));
+    }
     for (const auto& descriptor:stored.at("columns")) {
         const auto name=descriptor.at("name").get<std::string>();
-        const Json schema={{"type",descriptor.at("type")},{"scale",descriptor.value("scale",0)}};
-        db.exec("INSERT INTO __col__ VALUES("+quote(group)+","+quote(name)+","+quote(schema.dump())+") "
-                "ON CONFLICT(group_name,name) DO UPDATE SET schema=json_set(excluded.schema,'$.scale',"
-                "max(json_extract(__col__.schema,'$.scale'),json_extract(excluded.schema,'$.scale')))");
+        const int old=schema.contains(name)?schema.at(name).value("scale",0):0;
+        schema[name]={{"type",descriptor.at("type")},{"scale",std::max(old,descriptor.value("scale",0))}};
     }
-    db.exec("INSERT INTO __timefile__(group_name,symbol,path,first_time,last_time,rows) VALUES("
-            +quote(group)+","+quote(symbol)+","+quote(relative)+","+std::to_string(time.front())+","
-            +std::to_string(time.back())+","+std::to_string(time.size())+") "
-            "ON CONFLICT(path) DO UPDATE SET first_time=excluded.first_time,last_time=excluded.last_time,rows=excluded.rows");
+    db.exec("INSERT INTO __group__(name,kind,schema) VALUES("+quote(group)+",'timeseries',"+quote(schema.dump())+") "
+            "ON CONFLICT(name) DO UPDATE SET schema=excluded.schema");
+    const auto group_key=storage::group_id(db,group), symbol_key=storage::symbol_id(db,symbol);
+    db.exec("INSERT INTO __timefile__(group_id,symbol_id,name,first_time,last_time,rows) VALUES("+
+            std::to_string(group_key)+","+std::to_string(symbol_key)+","+quote(path.filename().string())+","+std::to_string(time.front())+","+
+            std::to_string(time.back())+","+std::to_string(time.size())+") "
+            "ON CONFLICT(group_id,symbol_id,name) DO UPDATE SET first_time=excluded.first_time,last_time=excluded.last_time,rows=excluded.rows");
 }
 
 void set_taker_encoding(Table& table, const Options& options) {
@@ -225,13 +352,13 @@ void consolidate(DB& db, const Options& options, const std::string& group, const
         set_taker_encoding(table,options);
         write(destination,table);
         db.exec("BEGIN IMMEDIATE");
-        register_file(db,options.root,destination,table);
-        const auto target=quote(fs::relative(destination,options.root).generic_string());
+        register_file(db,destination,table);
+        const auto target=db.file_id(group,symbol,destination.filename().string());
         for (const auto& path:paths) {
             if (path==destination) continue;
-            const auto old=quote(fs::relative(path,options.root).generic_string());
-            db.exec("UPDATE __binance_file_mapping__ SET path="+target+" WHERE path="+old);
-            db.exec("DELETE FROM __timefile__ WHERE path="+old);
+            const auto old=db.file_id(group,symbol,path.filename().string());
+            db.remap_file(old,target);
+            db.exec("DELETE FROM __timefile__ WHERE id="+std::to_string(old));
         }
         db.exec("COMMIT");
         for (const auto& path:paths) if (path!=destination) fs::remove(path);
@@ -240,12 +367,21 @@ void consolidate(DB& db, const Options& options, const std::string& group, const
 
 void store_source(DB& db, const Options& options, const std::string& group,
                   const std::string& symbol, const std::string& period,
-                  const std::string& key, Table table) {
+                  const Source& source_id, Table table, int64_t covered_until=0) {
     const auto directory=options.root/group/symbol;
     auto destination=directory/(period+".mkp");
     const auto begin=timestamp(period.size()==7?period+"-01":period);
     const auto date=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{begin}})};
     const auto end=duration_cast<milliseconds>((period.size()==7?sys_days{date+months{1}}:sys_days{date}+days{1}).time_since_epoch()).count();
+    if (source_id.funding) {
+        db.exec("BEGIN IMMEDIATE");
+        write_funding(db,table,begin,end);
+        db.exec("UPDATE "+source_id.table()+" SET rows="+std::to_string(table.columns.at("time").size())+
+            ",error=NULL"+(source_id.rest?",covered_until="+std::to_string(covered_until):",file_id=NULL")+
+            " WHERE "+source_id.condition());
+        db.exec("COMMIT");
+        return;
+    }
     std::vector<fs::path> replaced;
     std::vector<Table> tables{table};
     if (fs::exists(directory)) {
@@ -270,21 +406,22 @@ void store_source(DB& db, const Options& options, const std::string& group,
     set_taker_encoding(combined,options);
     write(destination,combined);
     db.exec("BEGIN IMMEDIATE");
-    register_file(db,options.root,destination,combined);
-    const auto target=quote(fs::relative(destination,options.root).generic_string());
+    register_file(db,destination,combined);
+    const auto target=db.file_id(group,symbol,destination.filename().string());
     for (const auto& path:replaced) {
         if(path==destination) continue;
-        const auto old=quote(fs::relative(path,options.root).generic_string());
-        db.exec("UPDATE __binance_file_mapping__ SET path="+target+" WHERE path="+old);
-        db.exec("DELETE FROM __timefile__ WHERE path="+old);
+        const auto old=db.file_id(group,symbol,path.filename().string());
+        db.remap_file(old,target);
+        db.exec("DELETE FROM __timefile__ WHERE id="+std::to_string(old));
     }
-    db.exec("INSERT OR REPLACE INTO __binance_file_mapping__ VALUES("+quote(key)+","+target+")");
-    db.exec("INSERT OR REPLACE INTO __binance_download_status__ VALUES("+quote(key)+",1,'')");
+    db.exec("UPDATE "+source_id.table()+" SET file_id="+std::to_string(target)+",error=NULL"+
+            (source_id.rest?",covered_until="+std::to_string(covered_until):"")+" WHERE "+source_id.condition());
     db.exec("COMMIT");
     for(const auto& path:replaced) if(path!=destination) fs::remove(path);
 }
 void funding_rest(DB& db, const Options& options, const std::string& symbol, int64_t begin) {
     if (begin>=options.end) return;
+    begin=duration_cast<milliseconds>(floor<days>(sys_time<milliseconds>{milliseconds{begin}}).time_since_epoch()).count();
     const auto key="rest/fundingRate/"+symbol+"/"+std::to_string(begin)+"-"+std::to_string(options.end)+".json";
     Json rows=Json::array();
     auto cache=options.cache/key;
@@ -323,10 +460,10 @@ void funding_rest(DB& db, const Options& options, const std::string& symbol, int
     for(auto& [period,csv_text]:days) {
         auto table=csv(csv_text.str(),"funding_rate_settlement",symbol,INT64_MIN,INT64_MAX);
         table.metadata["interval_hours_source"]="相邻实际结算时间差四舍五入到小时";
-        auto day_key=key+"#"+period;
-        if(db.completed(day_key,options.full)) continue;
-        db.exec("INSERT OR IGNORE INTO __binance_datavision_files__ VALUES("+quote(day_key)+",'funding_rate_settlement',"+quote(symbol)+","+quote(period)+")");
-        store_source(db,options,"funding_rate_settlement",symbol,period,day_key,std::move(table));
+        const auto covered_until=std::min(options.end,timestamp(period)+86400000);
+        const auto source_id=db.rest_source(symbol,period);
+        if(db.completed(source_id,options.full,covered_until)) continue;
+        store_source(db,options,"funding_rate_settlement",symbol,period,source_id,std::move(table),covered_until);
     }
 }
 void one(const Options& options, const std::string& group, const std::string& symbol) {
@@ -349,17 +486,17 @@ void one(const Options& options, const std::string& group, const std::string& sy
         }
     }
     for (const auto& [period,key]:remote) {
-        db.exec("INSERT OR IGNORE INTO __binance_datavision_files__ VALUES("+quote(key)+","+quote(group)+","+quote(symbol)+","+quote(period)+")");
-        if (db.completed(key,options.full)) continue;
+        const auto source_id=db.source(key,group,symbol,period);
+        if (db.completed(source_id,options.full)) continue;
         try {
             auto table=csv(unzip(source(options.cache,key)),group,symbol,INT64_MIN,INT64_MAX);
             if (table.columns.at("time").empty()) continue;
-            store_source(db,options,group,symbol,period,key,table);
+            store_source(db,options,group,symbol,period,source_id,table);
             std::lock_guard lock(output_mutex);
             std::cerr<<group<<" "<<symbol<<" "<<period<<" "<<table.columns.at("time").size()<<" 行\n";
         } catch (const std::exception& error) {
             sqlite3_exec(db.db,"ROLLBACK",nullptr,nullptr,nullptr);
-            db.exec("INSERT OR REPLACE INTO __binance_download_status__ VALUES("+quote(key)+",0,"+quote(error.what())+")");
+            db.exec("UPDATE __binance_datavision_files__ SET file_id=NULL,error="+quote(error.what())+" WHERE "+source_id.condition());
             throw;
         }
     }
@@ -371,7 +508,7 @@ void one(const Options& options, const std::string& group, const std::string& sy
         }
         funding_rest(db,options,symbol,begin);
     }
-    consolidate(db,options,group,symbol);
+    if (group!="funding_rate_settlement") consolidate(db,options,group,symbol);
 }
 }
 int64_t timestamp(std::string text) {
@@ -395,17 +532,19 @@ void download(const Options& options) {
     {
         DB db(options.root/"mkt.sqlite");
         sqlite3_stmt* packed=nullptr;
-        sqlite3_prepare_v2(db.db,"SELECT 1 FROM sqlite_master WHERE type='table' AND name='__blob__'",-1,&packed,nullptr);
-        const bool is_packed=sqlite3_step(packed)==SQLITE_ROW;
+        sqlite3_prepare_v2(db.db,"PRAGMA application_id",-1,&packed,nullptr);
+        const bool is_packed=sqlite3_step(packed)==SQLITE_ROW && sqlite3_column_int(packed,0)==0x4d4b5450;
         sqlite3_finalize(packed);
         if (is_packed) throw std::runtime_error("打包数据集不支持下载写入，请使用分散目录");
-        db.exec("PRAGMA journal_mode=WAL;"
-                "CREATE TABLE IF NOT EXISTS __group__(name TEXT PRIMARY KEY,kind TEXT);"
-                "CREATE TABLE IF NOT EXISTS __col__(group_name TEXT,name TEXT,schema TEXT,PRIMARY KEY(group_name,name));"
-                "CREATE TABLE IF NOT EXISTS __timefile__(id INTEGER PRIMARY KEY,group_name TEXT,symbol TEXT,path TEXT UNIQUE,first_time INTEGER,last_time INTEGER,rows INTEGER);"
-                "CREATE TABLE IF NOT EXISTS __binance_datavision_files__(key TEXT PRIMARY KEY,group_name TEXT,symbol TEXT,period TEXT);"
-                "CREATE TABLE IF NOT EXISTS __binance_download_status__(key TEXT PRIMARY KEY,success INTEGER,error TEXT);"
-                "CREATE TABLE IF NOT EXISTS __binance_file_mapping__(key TEXT PRIMARY KEY,path TEXT);");
+        storage::create_index(db);
+        db.exec("PRAGMA journal_mode=DELETE;"
+                "CREATE TABLE IF NOT EXISTS __binance_datavision_paths__(id INTEGER PRIMARY KEY,parent_id INTEGER,name TEXT,UNIQUE(parent_id,name));CREATE TABLE IF NOT EXISTS __binance_datavision_templates__(id INTEGER PRIMARY KEY,path_id INTEGER,group_id INTEGER,symbol_id INTEGER,UNIQUE(path_id,group_id,symbol_id));"
+                "CREATE TABLE IF NOT EXISTS __binance_datavision_files__(template_id INTEGER,period INTEGER,file_id INTEGER,error TEXT,rows INTEGER,PRIMARY KEY(template_id,period)) WITHOUT ROWID;"
+                "CREATE TABLE IF NOT EXISTS __binance_rest_funding__(symbol_id INTEGER,period INTEGER,rows INTEGER,error TEXT,covered_until INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(symbol_id,period)) WITHOUT ROWID;");
+        if(std::find(options.groups.begin(),options.groups.end(),"funding_rate_settlement")!=options.groups.end()) {
+            if(!fs::exists(options.root/"funding.sqlite")) db.attach_funding();
+            create_funding(db);
+        }
     }
     std::vector<std::pair<std::string,std::string>> jobs;
     for (const auto& group:options.groups) {
@@ -451,7 +590,7 @@ void download(const Options& options) {
         db.exec("DROP TABLE IF EXISTS exchangeinfo");
         db.exec("CREATE TABLE exchangeinfo("+columns+")");
         db.exec("INSERT INTO exchangeinfo VALUES("+values+")");
-        db.exec("INSERT OR REPLACE INTO __group__ VALUES('exchangeinfo','ordinary')");
+        db.exec("INSERT INTO __group__(name,kind,storage) VALUES('exchangeinfo','ordinary','sqlite') ON CONFLICT(name) DO UPDATE SET kind=excluded.kind,storage=excluded.storage");
         db.exec("COMMIT");
     }
     if (!errors.empty()) {

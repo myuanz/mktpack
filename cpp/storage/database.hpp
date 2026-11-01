@@ -56,20 +56,45 @@ struct Statement {
     int64_t integer(int index) const { return sqlite3_column_int64(statement,index); }
 };
 
-inline bool has_table(Database& db, const std::string& name) {
-    Statement query(db,"SELECT 1 FROM sqlite_master WHERE type='table' AND name=?");
-    query.text(1,name);
-    return query.next();
+inline std::string identifier(const std::string& name) {
+    std::string result="\"";
+    for (char c:name) { result+=c; if (c=='"') result+=c; }
+    return result+'"';
 }
+
+inline void create_index(Database& db) {
+    db.exec("CREATE TABLE IF NOT EXISTS __group__(id INTEGER PRIMARY KEY,name TEXT UNIQUE,kind TEXT,schema TEXT NOT NULL DEFAULT '{}',"
+            "storage TEXT NOT NULL DEFAULT 'mkp',location TEXT NOT NULL DEFAULT '',table_name TEXT NOT NULL DEFAULT '',"
+            "time_column TEXT NOT NULL DEFAULT 'time',symbol_column TEXT NOT NULL DEFAULT 'symbol_id');"
+            "CREATE TABLE IF NOT EXISTS __symbols__(id INTEGER PRIMARY KEY,name TEXT UNIQUE);"
+            "CREATE TABLE IF NOT EXISTS __timefile__(id INTEGER PRIMARY KEY,group_id INTEGER,symbol_id INTEGER,name TEXT,first_time INTEGER,last_time INTEGER,rows INTEGER,volume INTEGER NOT NULL DEFAULT 0,UNIQUE(group_id,symbol_id,name));"
+            "CREATE TABLE IF NOT EXISTS __sqlite_partitions__(group_id INTEGER,start INTEGER,end INTEGER,volume INTEGER,rows INTEGER,first_time INTEGER,last_time INTEGER,PRIMARY KEY(group_id,start)) WITHOUT ROWID;");
+}
+
+inline int64_t symbol_id(Database& db,const std::string& symbol) {
+    Statement insert(db,"INSERT OR IGNORE INTO __symbols__(name) VALUES(?)");
+    insert.text(1,symbol); insert.next();
+    Statement query(db,"SELECT id FROM __symbols__ WHERE name=?");
+    query.text(1,symbol); query.next();
+    return query.integer(0);
+}
+
+inline int64_t group_id(Database& db,const std::string& group) {
+    Statement insert(db,"INSERT OR IGNORE INTO __group__(name,kind) VALUES(?,'timeseries')");
+    insert.text(1,group); insert.next();
+    Statement query(db,"SELECT id FROM __group__ WHERE name=?");
+    query.text(1,group); query.next();
+    return query.integer(0);
+}
+
 
 class PayloadReader {
     Database& index;
-    bool packed;
     std::map<std::string,std::unique_ptr<Database>> volumes;
 public:
-    explicit PayloadReader(Database& database):index(database),packed(has_table(database,"__blob__")) {}
-    std::vector<uint8_t> read(int64_t id, const std::string& path) {
-        if (!packed) {
+    explicit PayloadReader(Database& database):index(database) {}
+    std::vector<uint8_t> read(int64_t id, const std::string& path, int64_t volume_id) {
+        if (!volume_id) {
             std::ifstream input(index.root/path,std::ios::binary|std::ios::ate);
             if (!input) throw std::runtime_error("无法读取："+(index.root/path).string());
             std::vector<uint8_t> bytes(input.tellg());
@@ -78,10 +103,7 @@ public:
             if (!input) throw std::runtime_error("载荷读取失败："+path);
             return bytes;
         }
-        Statement location(index,"SELECT volume FROM __blob__ WHERE blob_id=?");
-        location.integer(1,id);
-        if (!location.next()) throw std::runtime_error("缺少分卷映射："+path);
-        const auto name=location.text(0);
+        const auto name="mkt.data."+std::to_string(volume_id);
         auto& volume=volumes[name];
         if (!volume) volume=std::make_unique<Database>(index.root/name);
         Statement query(*volume,"SELECT bytes FROM blob WHERE id=?");
