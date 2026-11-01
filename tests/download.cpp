@@ -4,6 +4,7 @@
 namespace {
 std::map<std::string,std::string> responses;
 int requests=0;
+std::vector<std::string> requested_urls;
 void expect(bool ok, const char* message) { if(!ok) throw std::runtime_error(message); }
 std::string zipped(const std::string& text) {
     mz_zip_archive archive{};
@@ -25,8 +26,35 @@ std::string listing(const std::vector<std::string>& keys) {
 namespace mktpack::binance {
 std::string http_get(const std::string& url) {
     ++requests;
-    if(!responses.contains(url)) throw std::runtime_error("模拟下载失败");
-    return responses.at(url);
+    requested_urls.push_back(url);
+    if(responses.contains(url)) return responses.at(url);
+    const auto marker=url.find("?list-type=2&prefix=");
+    if(marker!=std::string::npos) {
+        const auto begin=marker+20;
+        const auto prefix=url.substr(begin,url.find('&',begin)-begin);
+        const bool directories=url.find("&delimiter=/")!=std::string::npos;
+        std::set<std::string> keys,folders;
+        for(const auto& [address,body]:responses) {
+            if(address.find("?list-type=2&prefix=")==std::string::npos) continue;
+            pugi::xml_document doc;
+            if(!doc.load_buffer(body.data(),body.size())) continue;
+            for(auto item:doc.document_element().children("Contents")) {
+                const std::string key=item.child_value("Key");
+                if(!key.starts_with(prefix)) continue;
+                if(directories) {
+                    const auto slash=key.find('/',prefix.size());
+                    if(slash!=std::string::npos) folders.insert(key.substr(0,slash+1));
+                } else keys.insert(key);
+            }
+        }
+        if(directories) {
+            std::string xml="<ListBucketResult>";
+            for(const auto& folder:folders) xml+="<CommonPrefixes><Prefix>"+folder+"</Prefix></CommonPrefixes>";
+            return xml+"</ListBucketResult>";
+        }
+        return listing({keys.begin(),keys.end()});
+    }
+    throw std::runtime_error("模拟下载失败："+url);
 }
 }
 int main() {
@@ -52,7 +80,7 @@ int main() {
     expect(read(annual).columns.at("close")==std::vector<int64_t>({21,31}),"月包替换年内日数据失败");
     auto before=requests;
     download(options);
-    expect(requests-before==2,"增量不应下载已有载荷");
+    expect(requests-before==1,"已有月归档不应重复列举日目录或下载载荷");
     fs::remove(annual);
     options.full=true;
     download(options);
@@ -204,6 +232,90 @@ int main() {
         download(rest_options);
         expect(count("funding_rate_settlement")==2,"资金费率全量检查未补齐缺行");
 
+    }
+    {
+        Options scan; scan.root=root/"scans"; scan.groups={"oi"}; scan.symbols={"XUSDT"}; scan.jobs=1;
+        scan.start=timestamp("2024-01-01"); scan.end=timestamp("2026-03-01");
+        const auto directory=source_directory("oi","XUSDT",false);
+        const auto key=[&](const std::string& date) {return directory+"XUSDT-metrics-"+date+".zip";};
+        auto sample=[](const std::string& date) {return zipped(date+" 00:00:00,XUSDT,1.25,2.5\n");};
+        responses[host+"?list-type=2&prefix="+directory]=listing({key("2024-01-01"),key("2025-01-01"),key("2026-02-01")});
+        responses[host+key("2025-01-01")]=sample("2025-01-01");
+        responses[host+key("2026-02-01")]=sample("2026-02-01");
+        std::vector<Progress> events;
+        scan.progress=[&](const auto& event) {events.push_back(event);};
+        const auto initial=requested_urls.size();
+        bool failed=false;
+        try {download(scan);} catch(const std::exception&) {failed=true;}
+        expect(failed,"旧日期失败没有报告");
+        expect(std::find_if(events.begin(),events.end(),[](const auto& e) {return e.stage=="错误" && e.detail.find("2024-01-01")!=std::string::npos;})!=events.end(),"来源错误未及时报告");
+        expect(requested_urls[initial].ends_with("XUSDT-metrics-2026-02"),"发现未从最近月份开始");
+        const auto first_payload=std::find_if(requested_urls.begin()+initial,requested_urls.end(),[](const auto& url) {return url.ends_with(".zip");});
+        expect(first_payload!=requested_urls.end() && first_payload->ends_with("2026-02-01.zip"),"下载未从最近日期开始");
+        responses[host+key("2024-01-01")]=sample("2024-01-01");
+        const auto retry=requested_urls.size();
+        download(scan);
+        expect(requested_urls.size()-retry==2,"增量应只刷新末月目录并补齐已登记的旧失败项");
+        expect(requested_urls.back()==host+key("2024-01-01"),"旧失败项被扫描范围跳过");
+        const auto unchanged=requests;
+        download(scan);
+        expect(requests-unchanged==1,"增量重复扫描了历史月份");
+        for(const auto& stage:{"发现","下载","写入","合并","完成"})
+            expect(std::find_if(events.begin(),events.end(),[&](const auto& e) {return e.slot==1 && e.stage==stage;})!=events.end(),"工作槽缺少阶段事件");
+        fs::remove(scan.root/"oi/XUSDT/2024.mkp");
+        scan.full=true;
+        const auto full=requested_urls.size();
+        download(scan);
+        expect(fs::exists(scan.root/"oi/XUSDT/2024.mkp"),"全量检查未恢复历史载荷");
+        expect(std::find(requested_urls.begin()+full,requested_urls.end(),host+"?list-type=2&prefix="+directory+"XUSDT-metrics-2024-01")!=requested_urls.end(),"全量检查未扫描历史目录");
+        scan.full=false; scan.start=timestamp("2023-01-01");
+        responses[host+"?list-type=2&prefix="+directory]=listing({key("2023-01-01"),key("2024-01-01"),key("2025-01-01"),key("2026-02-01")});
+        responses[host+key("2023-01-01")]=sample("2023-01-01");
+        download(scan);
+        expect(fs::exists(scan.root/"oi/XUSDT/2023.mkp"),"扩大历史范围未发现新增区间");
+
+        // 中途发现失败，重跑必须继续尚未扫描的旧月份
+        auto interrupted=scan; interrupted.root=root/"interrupted";
+        interrupted.start=timestamp("2024-01-01"); interrupted.end=timestamp("2024-03-01");
+        const auto broken=host+"?list-type=2&prefix="+directory+"XUSDT-metrics-2024-01";
+        responses[broken]="broken xml";
+        failed=false;
+        try {download(interrupted);} catch(const std::exception&) {failed=true;}
+        expect(failed,"发现错误未报告");
+        responses.erase(broken);
+        download(interrupted);
+        expect(fs::exists(interrupted.root/"oi/XUSDT/2024.mkp"),"中断后遗漏未扫描月份");
+
+        // 空归档作为成功来源记录，不重复下载
+        const auto empty=key("2026-02-02");
+        responses[host+"?list-type=2&prefix="+directory]=listing({empty});
+        responses[host+empty]=zipped("create_time,symbol,sum_open_interest,sum_open_interest_value\n");
+        download(scan);
+        const auto empty_before=requests;
+        download(scan);
+        expect(requests-empty_before==1,"空归档被反复下载");
+    }
+    {
+        Options all; all.root=root/"all-symbols"; all.groups={"oi"}; all.jobs=1;
+        all.start=timestamp("2024-01-01"); all.end=timestamp("2024-02-01");
+        const auto add_symbol=[&](const std::string& symbol) {
+            const auto directory=source_directory("oi",symbol,false);
+            const auto key=directory+source_filename("oi",symbol)+"2024-01-01.zip";
+            responses[host+"?list-type=2&prefix="+directory]=listing({key});
+            responses[host+key]=zipped("2024-01-01 00:00:00,"+symbol+",1,2\n");
+        };
+        add_symbol("NEWUSDT");
+        download(all);
+        expect(fs::exists(all.root/"oi/NEWUSDT/2024.mkp"),"全品种发现遗漏品种");
+        add_symbol("LATERUSDT");
+        download(all);
+        expect(fs::exists(all.root/"oi/LATERUSDT/2024.mkp"),"增量未发现新合约");
+
+        const auto prefix=std::string("test/pagination/");
+        responses[host+"?list-type=2&prefix="+prefix+"&delimiter=/"]="<ListBucketResult><CommonPrefixes><Prefix>test/pagination/AUSDT/</Prefix></CommonPrefixes><NextContinuationToken>a+b=</NextContinuationToken></ListBucketResult>";
+        responses[host+"?list-type=2&prefix="+prefix+"&delimiter=/&continuation-token=a%2Bb%3D"]="<ListBucketResult><CommonPrefixes><Prefix>test/pagination/BUSDT/</Prefix></CommonPrefixes></ListBucketResult>";
+        expect(list(prefix,true)==std::vector<std::string>({prefix+"AUSDT/",prefix+"BUSDT/"}),"品种目录分页错误");
+        expect(url_encode("币/USDT",true)=="%E5%B8%81/USDT","非ASCII品种路径未转义");
     }
     fs::remove_all(root);
 }

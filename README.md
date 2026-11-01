@@ -31,6 +31,8 @@ table = market['kline'].read(
 info: dict = market['exchangeinfo']
 ```
 
+省略 `--symbols` 自动发现全部 USDT 品种。
+
 时间范围为 UTC `[start,end)`，定点数返回 Arrow decimal。币安下载默认将主动买量占比按 0.1 个百分点量化，添加 `--no-lossy-taker` 使用无损编码。`--full` 检查来源对应的本地载荷并补齐缺失数据。
 
 ## 打包

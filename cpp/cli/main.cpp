@@ -3,6 +3,7 @@
 #include <CLI/CLI.hpp>
 #include <chrono>
 #include <iostream>
+#include "progress.hpp"
 
 namespace {
 uint64_t file_size(const std::string& text) {
@@ -19,7 +20,7 @@ uint64_t file_size(const std::string& text) {
 }
 
 int main(int argc, char** argv) {
-    CLI::App app{"MTKPack"};
+    CLI::App app{"MktPack"};
     std::string root=".", file, start="2024-01-01", end, cache;
     mktpack::binance::Options options;
     app.add_option("--root", root);
@@ -27,7 +28,7 @@ int main(int argc, char** argv) {
     info->add_option("file", file)->required();
     auto binance=app.add_subcommand("binance");
     auto download=binance->add_subcommand("download");
-    download->add_option("--symbols", options.symbols)->required()->expected(-1);
+    download->add_option("--symbols", options.symbols,"品种列表，省略时自动发现全部 USDT 品种")->expected(-1);
     download->add_option("--groups", options.groups)->expected(-1);
     download->add_option("--start", start);
     download->add_option("--end", end);
@@ -57,7 +58,9 @@ int main(int argc, char** argv) {
             options.end=end.empty()
                 ? std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now()).time_since_epoch()).count()
                 : mktpack::binance::timestamp(end);
-            if (options.start>options.end) throw std::runtime_error("start 晚于 end");
+            if (options.start>=options.end) throw std::runtime_error("需要 start < end");
+            mktpack::cli::DownloadProgress progress(options.jobs);
+            options.progress=[&](const auto& event) { progress.update(event); };
             mktpack::binance::download(options);
         } else if (*packing) {
             package_options.max_file_size=file_size(maximum);

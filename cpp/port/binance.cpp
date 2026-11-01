@@ -17,8 +17,16 @@ namespace fs=std::filesystem;
 using namespace std::chrono;
 namespace {
 const std::string host="https://s3-ap-northeast-1.amazonaws.com/data.binance.vision/";
-std::mutex output_mutex;
+using Reporter=std::function<void(const std::string&,const std::string&)>;
 std::string quote(const std::string& s){std::string q="'";for(char c:s){q+=c;if(c=='\'')q+=c;}return q+"'";}
+std::string url_encode(const std::string& text,bool slash=false) {
+    std::string result;
+    for(unsigned char c:text) {
+        if((c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') || c=='-' || c=='_' || c=='.' || c=='~' || (slash && c=='/')) result+=c;
+        else { char escaped[4];snprintf(escaped,sizeof escaped,"%%%02X",c);result+=escaped; }
+    }
+    return result;
+}
 Json funding_schema(int scale) {
     return {{"time",{{"type","timestamp"},{"scale",0}}},
             {"symbol",{{"type","string"}}},
@@ -155,7 +163,7 @@ struct DB:storage::Database {
         }
         sqlite3_stmt* statement;
         const auto sql="SELECT s.file_id,s.error,g.name||'/'||t.name||'/'||f.name,"+
-            std::string(source.rest?"s.covered_until":"0")+" FROM "+source.table()+" s "
+            std::string(source.rest?"s.covered_until":"0")+",s.rows FROM "+source.table()+" s "
             "LEFT JOIN __timefile__ f ON f.id=s.file_id LEFT JOIN __group__ g ON g.id=f.group_id "
             "LEFT JOIN __symbols__ t ON t.id=f.symbol_id WHERE s."+source.key()+"=? AND s.period=?";
         sqlite3_prepare_v2(db,sql.c_str(),-1,&statement,nullptr);
@@ -163,6 +171,7 @@ struct DB:storage::Database {
         sqlite3_bind_int(statement,2,source.period);
         bool ready=sqlite3_step(statement)==SQLITE_ROW && sqlite3_column_type(statement,0)!=SQLITE_NULL
                    && sqlite3_column_type(statement,1)==SQLITE_NULL;
+        const bool empty=sqlite3_column_type(statement,4)!=SQLITE_NULL && sqlite3_column_int64(statement,4)==0 && sqlite3_column_type(statement,1)==SQLITE_NULL;
         const bool covered=sqlite3_column_int64(statement,3)>=required_end;
         int64_t missing=0;
         if (ready && verify_presence) {
@@ -174,24 +183,17 @@ struct DB:storage::Database {
         if (missing) {
             exec("UPDATE __binance_datavision_files__ SET error='载荷缺失' WHERE file_id="+std::to_string(missing));
         }
-        return ready && covered;
+        return (ready || empty) && covered;
     }
 };
-std::vector<std::string> list(const std::string& prefix) {
+std::vector<std::string> list(const std::string& prefix,bool directories=false) {
     std::vector<std::string> result;
     std::string token;
     do {
-        std::string url=host+"?list-type=2&prefix="+prefix;
+        std::string url=host+"?list-type=2&prefix="+url_encode(prefix,true);
+        if(directories) url+="&delimiter=/";
         if (!token.empty()) {
-            url+="&continuation-token=";
-            for (unsigned char c:token) {
-                if (isalnum(c) || c=='-' || c=='_' || c=='.' || c=='~') url+=c;
-                else {
-                    char escaped[4];
-                    snprintf(escaped,sizeof escaped,"%%%02X",c);
-                    url+=escaped;
-                }
-            }
+            url+="&continuation-token="+url_encode(token);
         }
         const auto xml=http_get(url);
         pugi::xml_document document;
@@ -201,6 +203,7 @@ std::vector<std::string> list(const std::string& prefix) {
             const std::string key=child.child_value("Key");
             if (key.ends_with(".zip")) result.push_back(key);
         }
+        if(directories) for(auto child:root.children("CommonPrefixes")) result.emplace_back(child.child_value("Prefix"));
         token=root.child_value("NextContinuationToken");
     } while (!token.empty());
     return result;
@@ -234,7 +237,7 @@ std::string source(const fs::path& cache, const std::string& key) {
         std::ifstream input(path,std::ios::binary);
         return {std::istreambuf_iterator<char>(input),{}};
     }
-    const auto bytes=http_get(host+key);
+    const auto bytes=http_get(host+url_encode(key,true));
     if (!cache.empty()) {
         fs::create_directories(path.parent_path());
         std::ofstream output(path,std::ios::binary);
@@ -327,7 +330,7 @@ void set_taker_encoding(Table& table, const Options& options) {
     }
 }
 
-void consolidate(DB& db, const Options& options, const std::string& group, const std::string& symbol) {
+void consolidate(DB& db, const Options& options, const std::string& group, const std::string& symbol,const Reporter& progress={}) {
     const auto directory=options.root/group/symbol;
     if (!fs::exists(directory)) return;
     const auto today=floor<days>(system_clock::now());
@@ -346,6 +349,7 @@ void consolidate(DB& db, const Options& options, const std::string& group, const
     for (auto& [period,paths]:buckets) {
         const auto destination=directory/(period+".mkp");
         if (paths.size()==1 && paths.front()==destination) continue;
+        if(progress) progress("合并",period);
         std::vector<Table> tables;
         for (const auto& path:paths) tables.push_back(read(path));
         auto table=merge(tables);
@@ -419,7 +423,7 @@ void store_source(DB& db, const Options& options, const std::string& group,
     db.exec("COMMIT");
     for(const auto& path:replaced) if(path!=destination) fs::remove(path);
 }
-void funding_rest(DB& db, const Options& options, const std::string& symbol, int64_t begin) {
+void funding_rest(DB& db, const Options& options, const std::string& symbol, int64_t begin,const Reporter& progress={}) {
     if (begin>=options.end) return;
     begin=duration_cast<milliseconds>(floor<days>(sys_time<milliseconds>{milliseconds{begin}}).time_since_epoch()).count();
     const auto key="rest/fundingRate/"+symbol+"/"+std::to_string(begin)+"-"+std::to_string(options.end)+".json";
@@ -431,7 +435,8 @@ void funding_rest(DB& db, const Options& options, const std::string& symbol, int
     } else {
         auto cursor=begin-86400000;
         while(cursor<options.end) {
-            auto page=Json::parse(http_get("https://fapi.binance.com/fapi/v1/fundingRate?symbol="+symbol+"&startTime="+std::to_string(cursor)+"&endTime="+std::to_string(options.end-1)+"&limit=1000"));
+            if(progress) progress("下载","REST 资金费率 "+std::to_string(cursor));
+            auto page=Json::parse(http_get("https://fapi.binance.com/fapi/v1/fundingRate?symbol="+url_encode(symbol)+"&startTime="+std::to_string(cursor)+"&endTime="+std::to_string(options.end-1)+"&limit=1000"));
             if(!page.is_array()) throw std::runtime_error("资金费率REST响应错误："+page.dump());
             if(page.empty()) break;
             for(const auto& row:page) rows.push_back(row);
@@ -463,53 +468,154 @@ void funding_rest(DB& db, const Options& options, const std::string& symbol, int
         const auto covered_until=std::min(options.end,timestamp(period)+86400000);
         const auto source_id=db.rest_source(symbol,period);
         if(db.completed(source_id,options.full,covered_until)) continue;
+        if(progress) progress("写入","REST "+period);
         store_source(db,options,"funding_rate_settlement",symbol,period,source_id,std::move(table),covered_until);
     }
 }
-void one(const Options& options, const std::string& group, const std::string& symbol) {
-    DB db(options.root/"mkt.sqlite");
+std::string period_text(int64_t value) {
+    auto text=std::to_string(value);
+    text.insert(4,"-");
+    if(text.size()>7) text.insert(7,"-");
+    return text;
+}
+std::pair<int64_t,int64_t> period_range(const std::string& period) {
+    const auto start=timestamp(period.size()==7?period+"-01":period);
+    const auto date=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{start}})};
+    const auto end=duration_cast<milliseconds>((period.size()==7?sys_days{date+months{1}}:sys_days{date}+days{1}).time_since_epoch()).count();
+    return {start,end};
+}
+std::string source_directory(const std::string& group,const std::string& symbol,bool monthly) {
+    return "data/futures/um/"+std::string(monthly?"monthly/":"daily/")+
+        (group=="kline"?"klines/":group=="oi"?"metrics/":"fundingRate/")+symbol+"/"+(group=="kline"?"1m/":"");
+}
+std::string source_filename(const std::string& group,const std::string& symbol) {
+    return symbol+"-"+(group=="kline"?"1m-":group=="oi"?"metrics-":"fundingRate-");
+}
+
+std::map<std::string,std::string> discover(DB& db,const Options& options,const std::string& group,
+                                          const std::string& symbol,const Reporter& progress) {
     std::map<std::string,std::string> remote;
-    for (auto branch:{"monthly","daily"}) {
-        if (group=="oi" && std::string(branch)=="monthly") continue;
-        if (group=="funding_rate_settlement" && std::string(branch)=="daily") continue;
-        const auto kind=group=="kline"?"klines":group=="oi"?"metrics":"fundingRate";
-        const std::string prefix="data/futures/um/"+std::string(branch)+"/"+kind+"/"+symbol+"/"+(group=="kline"?"1m/":"");
-        for (const auto& key:list(prefix)) {
-            const auto name=fs::path(key).stem().string();
-            const auto period=name.substr(name.size()-(std::string(branch)=="monthly"?7:10));
-            const auto begin=timestamp(period.size()==7?period+"-01":period);
-            const auto date=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{begin}})};
-            const auto finish=duration_cast<milliseconds>((period.size()==7?sys_days{date+months{1}}:sys_days{date}+days{1}).time_since_epoch()).count();
-            if (begin>=options.end || finish<=options.start) continue;
-            if (period.size()==10 && remote.contains(period.substr(0,7))) continue;
-            remote[period]=key;
+    const auto group_key=storage::group_id(db,group),symbol_key=storage::symbol_id(db,symbol);
+    // 来源清单保留待下载和失败记录；扫描范围只用于减少远端目录请求
+    {
+        storage::Statement known(db,"SELECT f.period FROM __binance_datavision_files__ f JOIN __binance_datavision_templates__ t ON t.id=f.template_id WHERE t.group_id=? AND t.symbol_id=?");
+        known.integer(1,group_key); known.integer(2,symbol_key);
+        while(known.next()) {
+            const auto period=period_text(known.integer(0));
+            const auto [first,last]=period_range(period);
+            if(first<options.end && last>options.start)
+                remote[period]=source_directory(group,symbol,period.size()==7)+source_filename(group,symbol)+period+".zip";
         }
     }
-    for (const auto& [period,key]:remote) {
+    const auto first_date=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{options.start}})};
+    const auto last_date=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{options.end-1}})};
+    for(bool monthly:{true,false}) {
+        if((group=="oi" && monthly) || (group=="funding_rate_settlement" && !monthly)) continue;
+        int64_t covered_start=INT64_MAX,covered_end=INT64_MIN;
+        {
+            storage::Statement scan(db,"SELECT start,end FROM __binance_datavision_scans__ WHERE group_id=? AND symbol_id=? AND monthly=?");
+            scan.integer(1,group_key); scan.integer(2,symbol_key); scan.integer(3,monthly);
+            if(scan.next()) {covered_start=scan.integer(0);covered_end=scan.integer(1);}
+        }
+        auto cursor=monthly?last_date.year()/January:last_date.year()/last_date.month();
+        const auto oldest=monthly?first_date.year()/January:first_date.year()/first_date.month();
+        const auto step=months{monthly?12:1};
+        const auto latest=cursor;
+        for(;cursor>=oldest;cursor-=step) {
+            const auto begin=duration_cast<milliseconds>(sys_days{cursor/1}.time_since_epoch()).count();
+            const auto end=duration_cast<milliseconds>(sys_days{(cursor+step)/1}.time_since_epoch()).count();
+            char label[8]; snprintf(label,sizeof label,"%04d-%02u",int(cursor.year()),unsigned(cursor.month()));
+            const auto period=std::string(label);
+            if(!monthly && remote.contains(period)) continue;
+            const bool covered=covered_start<=std::max(begin,options.start) && covered_end>=std::min(end,options.end);
+            if(!options.full && covered && cursor!=latest) continue;
+            const auto prefix=source_directory(group,symbol,monthly)+source_filename(group,symbol)+(monthly?period.substr(0,4):period);
+            progress("发现",(monthly?"月归档 ":"日归档 ")+(monthly?period.substr(0,4):period));
+            const auto keys=list(prefix);
+            db.exec("BEGIN IMMEDIATE");
+            for(const auto& key:keys) {
+                const auto name=fs::path(key).stem().string();
+                const auto date=name.substr(name.size()-(monthly?7:10));
+                const auto [first,last]=period_range(date);
+                if(first>=options.end || last<=options.start) continue;
+                db.source(key,group,symbol,date);
+                remote[date]=key;
+            }
+            db.exec("COMMIT");
+        }
+        // 不相交的查询范围只记本次范围，避免将未扫描的中间区域标为已完成
+        if(covered_start<=options.end && covered_end>=options.start) {
+            covered_start=std::min(covered_start,options.start); covered_end=std::max(covered_end,options.end);
+        } else { covered_start=options.start; covered_end=options.end; }
+        storage::Statement save(db,"INSERT INTO __binance_datavision_scans__ VALUES(?,?,?,?,?) ON CONFLICT(group_id,symbol_id,monthly) DO UPDATE SET start=excluded.start,end=excluded.end");
+        save.integer(1,group_key); save.integer(2,symbol_key); save.integer(3,monthly); save.integer(4,covered_start); save.integer(5,covered_end); save.next();
+    }
+    for(auto it=remote.begin();it!=remote.end();) {
+        if(it->first.size()==10 && remote.contains(it->first.substr(0,7))) it=remote.erase(it);
+        else ++it;
+    }
+    return remote;
+}
+
+std::vector<std::string> discover_symbols(const Options& options) {
+    std::set<std::string> symbols;
+    for(const auto& group:options.groups) {
+        if(group=="exchangeinfo") continue;
+        for(bool monthly:{true,false}) {
+            if((group=="oi" && monthly) || (group=="funding_rate_settlement" && !monthly)) continue;
+            const auto prefix="data/futures/um/"+std::string(monthly?"monthly/":"daily/")+
+                (group=="kline"?"klines/":group=="oi"?"metrics/":"fundingRate/");
+            for(auto path:list(prefix,true)) {
+                path.pop_back();
+                const auto symbol=fs::path(path).filename().string();
+                if(symbol.ends_with("USDT")) symbols.insert(symbol);
+            }
+        }
+    }
+    return {symbols.begin(),symbols.end()};
+}
+
+void one(const Options& options,const std::string& group,const std::string& symbol,size_t slot) {
+    DB db(options.root/"mkt.sqlite");
+    Progress state{slot,group,symbol,"发现","",0,0};
+    const Reporter report=[&](const auto& stage,const auto& detail) {
+        state.stage=stage;state.detail=detail;
+        if(options.progress) options.progress(state);
+    };
+    const auto remote=discover(db,options,group,symbol,report);
+    state.total=remote.size();
+    size_t failures=0;
+    for(auto it=remote.rbegin();it!=remote.rend();++it) {
+        const auto& [period,key]=*it;
         const auto source_id=db.source(key,group,symbol,period);
-        if (db.completed(source_id,options.full)) continue;
+        if(db.completed(source_id,options.full)) {++state.completed;continue;}
         try {
+            report("下载",period);
             auto table=csv(unzip(source(options.cache,key)),group,symbol,INT64_MIN,INT64_MAX);
-            if (table.columns.at("time").empty()) continue;
-            store_source(db,options,group,symbol,period,source_id,table);
-            std::lock_guard lock(output_mutex);
-            std::cerr<<group<<" "<<symbol<<" "<<period<<" "<<table.columns.at("time").size()<<" 行\n";
-        } catch (const std::exception& error) {
+            if(table.columns.at("time").empty()) {
+                db.exec("UPDATE __binance_datavision_files__ SET rows=0,error=NULL,file_id=NULL WHERE "+source_id.condition());
+            } else {
+                report("写入",period+" "+std::to_string(table.columns.at("time").size())+" 行");
+                store_source(db,options,group,symbol,period,source_id,std::move(table));
+            }
+        } catch(const std::exception& error) {
             sqlite3_exec(db.db,"ROLLBACK",nullptr,nullptr,nullptr);
             db.exec("UPDATE __binance_datavision_files__ SET file_id=NULL,error="+quote(error.what())+" WHERE "+source_id.condition());
-            throw;
+            ++failures;
+            report("错误",period+" "+error.what());
         }
+        ++state.completed;
     }
-    if (group=="funding_rate_settlement") {
+    if(group=="funding_rate_settlement") {
         int64_t begin=options.start;
-        for (const auto& [period,key]:remote) {
-            const auto date=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{timestamp(period+"-01")}})};
-            begin=std::max(begin,duration_cast<milliseconds>(sys_days{date+months{1}}.time_since_epoch()).count());
-        }
-        funding_rest(db,options,symbol,begin);
+        for(const auto& [period,key]:remote) begin=std::max(begin,period_range(period).second);
+        funding_rest(db,options,symbol,begin,report);
     }
-    if (group!="funding_rate_settlement") consolidate(db,options,group,symbol);
+    if(failures) throw std::runtime_error(std::to_string(failures)+" 个来源下载失败");
+    if(group!="funding_rate_settlement") consolidate(db,options,group,symbol,report);
+    report("完成",std::to_string(state.completed)+" 个来源已处理");
 }
+
 }
 int64_t timestamp(std::string text) {
     if (text.size()==8 && text.find('-')==std::string::npos) {
@@ -540,38 +646,50 @@ void download(const Options& options) {
         db.exec("PRAGMA journal_mode=DELETE;"
                 "CREATE TABLE IF NOT EXISTS __binance_datavision_paths__(id INTEGER PRIMARY KEY,parent_id INTEGER,name TEXT,UNIQUE(parent_id,name));CREATE TABLE IF NOT EXISTS __binance_datavision_templates__(id INTEGER PRIMARY KEY,path_id INTEGER,group_id INTEGER,symbol_id INTEGER,UNIQUE(path_id,group_id,symbol_id));"
                 "CREATE TABLE IF NOT EXISTS __binance_datavision_files__(template_id INTEGER,period INTEGER,file_id INTEGER,error TEXT,rows INTEGER,PRIMARY KEY(template_id,period)) WITHOUT ROWID;"
+                "CREATE TABLE IF NOT EXISTS __binance_datavision_scans__(group_id INTEGER,symbol_id INTEGER,monthly INTEGER,start INTEGER,end INTEGER,PRIMARY KEY(group_id,symbol_id,monthly)) WITHOUT ROWID;"
                 "CREATE TABLE IF NOT EXISTS __binance_rest_funding__(symbol_id INTEGER,period INTEGER,rows INTEGER,error TEXT,covered_until INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(symbol_id,period)) WITHOUT ROWID;");
         if(std::find(options.groups.begin(),options.groups.end(),"funding_rate_settlement")!=options.groups.end()) {
             if(!fs::exists(options.root/"funding.sqlite")) db.attach_funding();
             create_funding(db);
         }
     }
+    auto symbols=options.symbols;
+    if(symbols.empty()) {
+        if(options.progress) options.progress({0,"","","发现","全品种目录"});
+        symbols=discover_symbols(options);
+        if(options.progress) options.progress({0,"","","发现",std::to_string(symbols.size())+" 个 USDT 品种"});
+    }
     std::vector<std::pair<std::string,std::string>> jobs;
     for (const auto& group:options.groups) {
         if (group=="exchangeinfo") continue;
         if (group!="kline" && group!="oi" && group!="funding_rate_settlement") throw std::runtime_error("未知下载组："+group);
-        for (const auto& symbol:options.symbols) jobs.emplace_back(group,symbol);
+        for (const auto& symbol:symbols) jobs.emplace_back(group,symbol);
     }
-    std::atomic<size_t> next{0};
+    if(options.progress) options.progress({0,"","","总进度","",0,jobs.size()});
+    std::atomic<size_t> next{0},finished{0};
     std::mutex mutex;
     std::vector<std::string> errors;
     std::vector<std::thread> threads;
     for (size_t i=0;i<std::min(options.jobs,jobs.size());++i) {
-        threads.emplace_back([&] {
+        threads.emplace_back([&,slot=i+1] {
             while (true) {
                 const auto j=next++;
                 if (j>=jobs.size()) break;
                 try {
-                    one(options,jobs[j].first,jobs[j].second);
+                    one(options,jobs[j].first,jobs[j].second,slot);
                 } catch (const std::exception& error) {
+                    if(options.progress) options.progress({slot,jobs[j].first,jobs[j].second,"错误",error.what()});
                     std::lock_guard lock(mutex);
                     errors.push_back(jobs[j].first+" "+jobs[j].second+": "+error.what());
                 }
+                const auto done=++finished;
+                if(options.progress) options.progress({0,"","","总进度","",done,jobs.size()});
             }
         });
     }
     for (auto& thread:threads) thread.join();
     if (std::find(options.groups.begin(),options.groups.end(),"exchangeinfo")!=options.groups.end()) {
+        if(options.progress) options.progress({0,"exchangeinfo","","下载","交易所信息"});
         const auto text=http_get("https://fapi.binance.com/fapi/v1/exchangeInfo");
         if (!options.cache.empty()) {
             fs::create_directories(options.cache/"api");
@@ -593,6 +711,7 @@ void download(const Options& options) {
         db.exec("INSERT INTO __group__(name,kind,storage) VALUES('exchangeinfo','ordinary','sqlite') ON CONFLICT(name) DO UPDATE SET kind=excluded.kind,storage=excluded.storage");
         db.exec("COMMIT");
     }
+    if(options.progress) options.progress({0,"","",errors.empty()?"完成":"错误",std::to_string(errors.size())+" 个任务失败",jobs.size(),jobs.size()});
     if (!errors.empty()) {
         std::string message;
         for (const auto& error:errors) message+=error+"\n";
