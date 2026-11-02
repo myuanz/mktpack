@@ -646,6 +646,7 @@ void download(const Options& options) {
         db.exec("PRAGMA journal_mode=DELETE;"
                 "CREATE TABLE IF NOT EXISTS __binance_datavision_paths__(id INTEGER PRIMARY KEY,parent_id INTEGER,name TEXT,UNIQUE(parent_id,name));CREATE TABLE IF NOT EXISTS __binance_datavision_templates__(id INTEGER PRIMARY KEY,path_id INTEGER,group_id INTEGER,symbol_id INTEGER,UNIQUE(path_id,group_id,symbol_id));"
                 "CREATE TABLE IF NOT EXISTS __binance_datavision_files__(template_id INTEGER,period INTEGER,file_id INTEGER,error TEXT,rows INTEGER,PRIMARY KEY(template_id,period)) WITHOUT ROWID;"
+                "CREATE INDEX IF NOT EXISTS __binance_datavision_files_file_id__ ON __binance_datavision_files__(file_id) WHERE file_id IS NOT NULL;"
                 "CREATE TABLE IF NOT EXISTS __binance_datavision_scans__(group_id INTEGER,symbol_id INTEGER,monthly INTEGER,start INTEGER,end INTEGER,PRIMARY KEY(group_id,symbol_id,monthly)) WITHOUT ROWID;"
                 "CREATE TABLE IF NOT EXISTS __binance_rest_funding__(symbol_id INTEGER,period INTEGER,rows INTEGER,error TEXT,covered_until INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(symbol_id,period)) WITHOUT ROWID;");
         if(std::find(options.groups.begin(),options.groups.end(),"funding_rate_settlement")!=options.groups.end()) {

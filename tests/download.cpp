@@ -74,6 +74,7 @@ int main() {
     download(options);
     auto annual=root/"kline/BTCUSDT/2024.mkp";
     expect(read(annual).columns.at("close")==std::vector<int64_t>{2},"日包合年失败");
+    { DB db(root/"mkt.sqlite"); db.exec("DROP INDEX __binance_datavision_files_file_id__"); }
     responses[host+"?list-type=2&prefix="+monthly]=listing({month});
     responses[host+month]=zipped("1704067200000,1.1,3.1,1.1,2.1,10.1,0,0,0,4.1,0,0\n1704153600000,2.1,4.1,2.1,3.1,12.1,0,0,0,5.1,0,0\n");
     download(options);
@@ -119,9 +120,12 @@ int main() {
                                 "WHERE s.file_id IS NOT NULL AND f.id IS NULL",-1,&query,nullptr);
         expect(sqlite3_step(query)==SQLITE_ROW && sqlite3_column_int(query,0)==0,"来源引用了已删除载荷");
         sqlite3_finalize(query);
-        sqlite3_prepare_v2(db.db,"SELECT count(*) FROM sqlite_master WHERE type='index' AND tbl_name='__binance_datavision_files__'",-1,&query,nullptr);
-        expect(sqlite3_step(query)==SQLITE_ROW && sqlite3_column_int(query,0)==0,"来源主键被重复索引");
-        sqlite3_finalize(query);
+        {
+            storage::Statement plan(db,"EXPLAIN QUERY PLAN UPDATE __binance_datavision_files__ SET file_id=1 WHERE file_id=2");
+            expect(plan.next() && plan.text(3).find("SEARCH")!=std::string::npos,"合并来源引用更新退化为全表扫描");
+            storage::Statement indexes(db,"SELECT count(*) FROM sqlite_master WHERE type='index' AND tbl_name='__binance_datavision_files__'");
+            expect(indexes.next() && indexes.integer(0)==1,"来源主键被重复索引");
+        }
         const auto january=db.source(month,"kline","BTCUSDT","2024-01");
         const auto feb=db.source(february,"kline","BTCUSDT","2024-02");
         const auto daily_source=db.source(day,"kline","BTCUSDT","2024-01-01");
