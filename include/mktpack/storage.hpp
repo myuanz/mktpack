@@ -12,6 +12,7 @@ struct PackageOptions {
     std::vector<std::string> groups, symbols;
     int64_t start=std::numeric_limits<int64_t>::min(), end=std::numeric_limits<int64_t>::max();
     uint64_t max_file_size=128ULL*1024*1024;
+    size_t jobs=4;
     std::function<void(const std::string&)> progress;
 };
 Json package(const std::filesystem::path& source,const std::filesystem::path& destination,const PackageOptions& options={});

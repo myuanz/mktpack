@@ -125,6 +125,20 @@ def test_sqlite_and_blob_share_volume(monthly_sqlite, tmp_path):
     check_package(packed)
 
 
+def test_parallel_mixed_package_matches_serial(monthly_sqlite, tmp_path):
+    serial = tmp_path / 'serial'
+    parallel = tmp_path / 'parallel'
+    expected = run_package(monthly_sqlite, serial, jobs=1, max_file_size=32768)
+    assert run_package(monthly_sqlite, parallel, jobs=4, max_file_size=32768) == expected
+    assert {p.name: p.read_bytes() for p in parallel.iterdir()} == {
+        p.name: p.read_bytes() for p in serial.iterdir()
+    }
+    repacked = tmp_path / 'repacked'
+    run_package(parallel, repacked, jobs=4, max_file_size=32768)
+    for group in ['kline', 'oi', 'settlements']:
+        assert mktpack.open(repacked)[group].read().equals(mktpack.open(monthly_sqlite)[group].read())
+
+
 @pytest.mark.parametrize('damage', ['volume', 'rows', 'mapping'])
 def test_check_sqlite_volume_damage(monthly_sqlite, tmp_path, damage):
     packed = tmp_path / 'damaged'

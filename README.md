@@ -38,7 +38,7 @@ info: dict = market['exchangeinfo']
 ## 打包
 
 ```sh
-build/cli/mkt --root data/binance package packaged-data --max-file-size 128MiB
+build/cli/mkt --root data/binance package packaged-data --max-file-size 128MiB --jobs 4
 ```
 
 可用 `--groups`、`--symbols`、`--start`、`--end` 筛选；普通表及其外置数据库完整保留。单个年度 MKP 或整月 SQLite 时序数据放不下时需调大分卷上限。

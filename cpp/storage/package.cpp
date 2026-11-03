@@ -2,6 +2,8 @@
 #include "sqlite.hpp"
 #include <chrono>
 #include <cstdio>
+#include <deque>
+#include <future>
 #include <set>
 #include <tuple>
 
@@ -17,7 +19,32 @@ struct File {
 struct Bucket {
     int64_t start, end;
     std::vector<File> files;
+    bool copied() const { return files.size()==1 && files[0].first>=start && files[0].last<end; }
 };
+std::vector<uint8_t> encode_bucket(const fs::path& source,const Bucket& bucket) {
+    Database input(source);
+    PayloadReader reader(input);
+    std::vector<Table> tables;
+    for (const auto& file:bucket.files) {
+        auto table=decode(reader.read(file.id,file.path,file.volume));
+        slice(table,bucket.start,bucket.end);
+        if (!table.columns.at("time").empty()) tables.push_back(std::move(table));
+    }
+    if (tables.empty()) return {};
+    auto combined=merge(tables);
+    // 混合无损和有损来源时保存已读出的值，避免再量化无损部分
+    for (auto& [name,schema]:combined.schema.items()) {
+        if (!schema.contains("encoding")) continue;
+        for (const auto& table:tables) {
+            if (table.schema.at(name).value("encoding","")!=schema.value("encoding","")) {
+                schema.erase("encoding");
+                schema.erase("reference");
+                break;
+            }
+        }
+    }
+    return encode(combined);
+}
 int year_of(int64_t time) {
     return int(year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{time}})}.year());
 }
@@ -94,6 +121,7 @@ void copy_index(Database& source,Database& destination) {
 Json package(const fs::path& source,const fs::path& destination,const PackageOptions& options) {
     if (options.start>=options.end) throw std::runtime_error("打包时间范围必须满足 start < end");
     if (!options.max_file_size) throw std::runtime_error("分卷上限必须大于零");
+    if (!options.jobs) throw std::runtime_error("并行任务数必须大于零");
     if (fs::exists(destination) && (!fs::is_directory(destination) || !fs::is_empty(destination)))
         throw std::runtime_error("打包目的地必须为空："+destination.string());
     Database input(source);
@@ -165,36 +193,32 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
             int64_t id=0, rows=0;
             size_t processed=0;
             output.exec("BEGIN");
-            for (const auto& [key,bucket]:buckets) {
-                const auto& [group,symbol,y]=key;
+            std::deque<std::future<std::vector<uint8_t>>> pending;
+            auto next=buckets.begin();
+            const auto submit=[&] {
+                while (next!=buckets.end() && next->second.copied()) ++next;
+                if (next==buckets.end()) return false;
+                const auto* bucket=&(next++)->second;
+                pending.push_back(std::async(options.jobs==1?std::launch::deferred:std::launch::async,
+                    [&,bucket] { return encode_bucket(source,*bucket); }));
+                return true;
+            };
+            for (size_t i=0;i<options.jobs && submit();++i) {}
+            for (const auto& entry:buckets) {
+                const auto& [group,symbol,y]=entry.first;
+                const auto& bucket=entry.second;
                 const auto label=group+"/"+symbol+"/"+std::to_string(y)+".mkp";
-                const bool copy=bucket.files.size()==1 && bucket.files[0].first>=bucket.start && bucket.files[0].last<bucket.end;
+                const bool copy=bucket.copied();
                 std::vector<uint8_t> payload;
                 if (copy) {
                     const auto& file=bucket.files[0];
                     payload=reader.read(file.id,file.path,file.volume);
                 } else {
-                    std::vector<Table> tables;
-                    for (const auto& file:bucket.files) {
-                        auto table=decode(reader.read(file.id,file.path,file.volume));
-                        slice(table,bucket.start,bucket.end);
-                        if (!table.columns.at("time").empty()) tables.push_back(std::move(table));
-                    }
-                    if (tables.empty()) continue;
-                    auto combined=merge(tables);
-                    // 混合无损和有损来源时保存已读出的值，避免再量化无损部分
-                    for (auto& [name,schema]:combined.schema.items()) {
-                        if (!schema.contains("encoding")) continue;
-                        for (const auto& table:tables) {
-                            if (table.schema.at(name).value("encoding","")!=schema.value("encoding","")) {
-                                schema.erase("encoding");
-                                schema.erase("reference");
-                                break;
-                            }
-                        }
-                    }
-                    payload=encode(combined);
+                    payload=pending.front().get();
+                    pending.pop_front();
+                    submit();
                 }
+                if (payload.empty()) continue;
                 const auto header=info(payload);
                 const auto volume=volumes.append(++id,payload,label);
                 Statement file(output,"INSERT INTO __timefile__(id,group_id,symbol_id,name,first_time,last_time,rows,volume) VALUES(?,?,?,?,?,?,?,?)");

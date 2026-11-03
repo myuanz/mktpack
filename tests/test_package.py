@@ -114,6 +114,24 @@ def payloads(root):
     return result
 
 
+@pytest.mark.parametrize('selection', [{}, {'start': 20240102, 'end': 20260201}])
+@pytest.mark.parametrize('packed', [False, True])
+def test_parallel_package_matches_serial(source, tmp_path, selection, packed):
+    root, _ = source
+    if packed:
+        initial = tmp_path / 'input-package'
+        run_package(root, initial, jobs=1, max_file_size=32768)
+        root = initial
+    serial = tmp_path / 'serial'
+    expected = run_package(root, serial, jobs=1, max_file_size=32768, **selection)
+    for jobs in [2, 4]:
+        parallel = tmp_path / f'parallel-{jobs}'
+        assert run_package(root, parallel, jobs=jobs, max_file_size=32768, **selection) == expected
+        assert {p.name: p.read_bytes() for p in parallel.iterdir()} == {
+            p.name: p.read_bytes() for p in serial.iterdir()
+        }
+
+
 def test_package_volumes_repack_and_index_path(source, tmp_path):
     root, db = source
     before = {p: p.read_bytes() for p in root.rglob('*.mkp')}
@@ -205,11 +223,13 @@ def test_size_boundary_rejection_and_index_warning(source, tmp_path):
     assert download.returncode == 1 and '不支持下载写入' in download.stderr
 
 
-def test_failed_pack_cleans_partial_output(source, tmp_path):
+@pytest.mark.parametrize('jobs', [1, 4])
+@pytest.mark.parametrize('missing', ['kline/DOGEUSDT/2024.mkp', 'kline/BTCUSDT/2025-02.mkp'])
+def test_failed_pack_cleans_partial_output(source, tmp_path, jobs, missing):
     root, _ = source
-    (root / 'kline/DOGEUSDT/2024.mkp').unlink()
+    (root / missing).unlink()
     destination = tmp_path / 'failed'
-    run_package(root, destination, max_file_size=32768, error='无法读取')
+    run_package(root, destination, jobs=jobs, max_file_size=32768, error='无法读取')
     assert list(destination.iterdir()) == []
 
 
@@ -272,6 +292,9 @@ def test_cli_package_and_invalid_arguments(source, tmp_path):
     assert mktpack.open(destination)['kline'].read().num_rows == 3
     for size in ['0', '-1', '1XB']:
         failed = subprocess.run([*command, str(tmp_path / 'invalid'), '--max-file-size', size], capture_output=True, text=True)
+        assert failed.returncode != 0
+    for jobs in ['0', '-1']:
+        failed = subprocess.run([*command, str(tmp_path / 'invalid-jobs'), '--jobs', jobs], capture_output=True, text=True)
         assert failed.returncode != 0
     run_package(root, tmp_path / 'dates', start=20250101, end=20240101, error='start < end')
     run_package(root, tmp_path / 'unknown', groups=['missing'], error='未知数据组')
