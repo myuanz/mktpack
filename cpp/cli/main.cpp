@@ -47,6 +47,7 @@ int main(int argc, char** argv) {
     import_ticks->add_option("--start",ctp_options.start,"起始交易日（含）");
     import_ticks->add_option("--end",ctp_options.end,"结束交易日（不含）");
     import_ticks->add_option("--symbols",ctp_options.symbols,"标准合约代码")->expected(-1);
+    import_ticks->add_option("--jobs",ctp_options.jobs,"并行编码任务数（默认 4）")->check(CLI::PositiveNumber);
     auto packing=app.add_subcommand("package","打包为 SQLite 载荷分卷");
     std::string destination, maximum="128MiB", package_start, package_end;
     mktpack::PackageOptions package_options;

@@ -10,6 +10,8 @@
 #include <cctype>
 #include <functional>
 #include <fstream>
+#include <future>
+#include <deque>
 #include <numeric>
 #include <set>
 
@@ -306,8 +308,11 @@ struct Stats {int64_t imported=0,skipped=0,blocks=0,rows=0;};
 class Sources {
     Database& db;
     int64_t group;
+    size_t jobs;
     const std::set<std::string>& wanted;
     const std::vector<Field> names=fields();
+    Json group_schema;
+    std::map<std::string,int64_t> symbol_keys;
 
     int64_t series_id(const std::string& series) {
         Statement insert(db,"INSERT OR IGNORE INTO __ctp_futures_series__(name) VALUES(?)");
@@ -328,25 +333,28 @@ class Sources {
         while(q.next())result.insert(q.text(0));
         return result;
     }
-    void publish(const Table& t,const fs::path& path,int64_t symbol,int period) {
-        write(path,t);
+    int64_t symbol_id(const std::string& symbol) {
+        auto found=symbol_keys.find(symbol);
+        if(found!=symbol_keys.end())return found->second;
+        const auto id=storage::symbol_id(db,symbol);
+        symbol_keys.emplace(symbol,id);
+        return id;
+    }
+    void publish(const Table& t,int64_t symbol,int period) {
         const auto& time=t.columns.at("time");
         Statement target(db,"INSERT INTO __timefile__(group_id,symbol_id,period,first_time,last_time,rows) VALUES(?,?,?,?,?,?)");
         target.integer(1,group);target.integer(2,symbol);target.integer(3,period);
         target.integer(4,time.front());target.integer(5,time.back());target.integer(6,time.size());target.next();
-        Statement query(db,"SELECT schema FROM __group__ WHERE id=?");query.integer(1,group);query.next();
-        auto group_schema=Json::parse(query.text(0));
-        for (const auto& c:info(path).at("columns").get<Json::array_t>()) {
-            const auto name=c.at("name").get<std::string>();
-            auto& spec=group_schema[name];
+    }
+    void merge_schema(Json& logical,const Table& table) {
+        for(const auto& [name,column]:table.schema.items()) {
+            auto& spec=logical[name];
             const int scale=spec.is_null()?0:spec.value("scale",0);
-            spec={{"type",c.at("type")},{"scale",std::max(scale,c.value("scale",0))}};
+            spec={{"type",column.at("type")},{"scale",std::max(scale,column.value("scale",0))}};
         }
-        Statement update(db,"UPDATE __group__ SET schema=? WHERE id=?");
-        update.text(1,group_schema.dump());update.integer(2,group);update.next();
     }
 public:
-    Sources(Database& database,const std::set<std::string>& requested):db(database),group(storage::group_id(db,"tick")),wanted(requested) {
+    Sources(Database& database,const std::set<std::string>& requested,size_t concurrency):db(database),group(storage::group_id(db,"tick")),jobs(concurrency),wanted(requested) {
         Json logical={{"symbol",{{"type","string"}}}};
         const auto specs=schema(names,0);
         for (const auto& [name,spec]:specs.items()) {
@@ -354,6 +362,8 @@ public:
         }
         Statement fill(db,"UPDATE __group__ SET schema=? WHERE id=? AND schema='{}'");
         fill.text(1,logical.dump());fill.integer(2,group);fill.next();
+        Statement current(db,"SELECT schema FROM __group__ WHERE id=?");
+        current.integer(1,group);current.next();group_schema=Json::parse(current.text(0));
     }
     void import(const Source& source,const Catalog& catalog,Stats& stats) {
         db.exec("BEGIN IMMEDIATE");
@@ -397,27 +407,46 @@ public:
             if (header.positions.empty()) throw std::runtime_error("缺少 CSV 表头："+source.path.string());
             const auto ymd=std::to_string(source.day);
             bool changed=false;
+            struct Prepared {std::string symbol;Table table;};
+            std::deque<std::future<Prepared>> pending;
+            auto next_schema=group_schema;
+            auto collect=[&] {
+                auto prepared=pending.front().get();pending.pop_front();
+                const auto sid=symbol_id(prepared.symbol);
+                publish(prepared.table,sid,source.day);
+                merge_schema(next_schema,prepared.table);
+                changed=true;stats.rows+=prepared.table.columns.at("time").size();++stats.blocks;
+            };
             for (auto& [symbol,block]:blocks) {
                 if (!block.columns.empty()) {
-                    auto sid=storage::symbol_id(db,symbol);
-                    auto t=block.finish(names,source.day);
                     auto path=db.root/"tick"/symbol/(ymd+".mkp");
                     publishing.push_back(path);
-                    publish(t,path,sid,source.day);
-                    changed=true;stats.rows+=t.columns.at("time").size();++stats.blocks;
+                    pending.push_back(std::async(jobs==1?std::launch::deferred:std::launch::async,
+                        [this,symbol,path,day=source.day,block=std::move(block)]() mutable {
+                            auto table=block.finish(names,day);
+                            write(path,table);
+                            return Prepared{symbol,std::move(table)};
+                        }));
+                    if(pending.size()>=jobs)collect();
                 }
+            }
+            while(!pending.empty())collect();
+            if(next_schema!=group_schema) {
+                Statement update(db,"UPDATE __group__ SET schema=? WHERE id=?");
+                update.text(1,next_schema.dump());update.integer(2,group);update.next();
             }
             if(wanted.empty()) {
                 Statement file(db,"INSERT INTO __ctp_futures_files__(series_id,period) VALUES(?,?)");
                 file.integer(1,series);file.integer(2,source.day);file.next();
             }
             db.exec("COMMIT");
+            group_schema=std::move(next_schema);
             if(changed)++stats.imported;else ++stats.skipped;
         } catch (...) {
             for (const auto& path:publishing) {
                 std::error_code ec;fs::remove(path,ec);fs::remove(path.string()+".tmp",ec);
             }
-            db.exec("ROLLBACK");throw;
+            db.exec("ROLLBACK");symbol_keys.clear();throw;
         }
     }
 };
@@ -600,6 +629,7 @@ std::vector<Source> discover(const std::vector<fs::path>& roots,int start,int en
 }
 
 Json import_ticks(const Options& options) {
+    if(!options.jobs)throw std::runtime_error("并行任务数必须大于零");
     const int start=options.start.empty()?0:date_number(options.start);
     const int end=options.end.empty()?INT_MAX:date_number(options.end);
     if (start>=end) throw std::runtime_error("需要 start < end");
@@ -623,16 +653,17 @@ Json import_ticks(const Options& options) {
         Statement check(db,"PRAGMA application_id");check.next();
         if (check.integer(0)==0x4d4b5450) throw std::runtime_error("不能导入到已打包数据集");
     }
-    db.exec("BEGIN IMMEDIATE");
+    db.exec("PRAGMA journal_mode=PERSIST;BEGIN IMMEDIATE");
     storage::create_index(db);
     db.exec("CREATE TABLE IF NOT EXISTS __ctp_futures_series__(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL);"
             "CREATE TABLE IF NOT EXISTS __ctp_futures_files__(series_id INTEGER,period INTEGER,PRIMARY KEY(series_id,period)) WITHOUT ROWID;");
-    Sources sources(db,symbols);
+    Sources sources(db,symbols,options.jobs);
     db.exec("COMMIT");
     Stats stats;
     for (const auto& file:files) sources.import(file,catalog,stats);
     auto today=std::chrono::year_month_day{std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now()+std::chrono::hours(8))};
     compact_volumes(db,catalog,int(today.year())*10000+int(unsigned(today.month()))*100+int(unsigned(today.day())));
+    db.exec("PRAGMA journal_mode=DELETE");
     return {{"imported",stats.imported},{"skipped",stats.skipped},{"blocks",stats.blocks},{"rows",stats.rows}};
 }
 }
