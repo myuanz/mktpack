@@ -12,7 +12,8 @@ struct Database {
     explicit Database(std::filesystem::path location, int flags=SQLITE_OPEN_READONLY) {
         path=std::filesystem::is_directory(location)?location/"mkt.sqlite":location;
         root=path.parent_path();
-        if (sqlite3_open_v2(path.c_str(),&db,flags,nullptr)!=SQLITE_OK) {
+        const auto filename=path.u8string();
+        if (sqlite3_open_v2(reinterpret_cast<const char*>(filename.c_str()),&db,flags,nullptr)!=SQLITE_OK) {
             const std::string error=sqlite3_errmsg(db);
             sqlite3_close(db);
             throw std::runtime_error("无法打开索引："+path.string()+"："+error);
