@@ -1,6 +1,9 @@
 # MktPack
 
-精确保存金融时序数据的 C++20 库，提供 Python Arrow 接口和原生 `mkt` 命令。当前支持基础 `.mkp` 格式、数据集查询，以及币安 USDT UM 永续 Kline、OI、结算资金费率和交易所信息下载。
+精确保存金融时序数据的 C++20 库，提供 Python Arrow 接口和原生 `mkt` 命令。当前支持基础 `.mkp` 格式、数据集查询，以及
+
+- 币安 USDT UM 永续 Kline、OI、结算资金费率和交易所信息下载
+- 国内期货 tick 导入。
 
 ## 开发
 
@@ -35,13 +38,21 @@ info: dict = market['exchangeinfo']
 
 时间范围为 UTC `[start,end)`，定点数返回 Arrow decimal。币安下载默认将主动买量占比按 0.1 个百分点量化，添加 `--no-lossy-taker` 使用无损编码。`--full` 检查来源对应的本地载荷并补齐缺失数据。
 
+## 导入国内期货 tick
+
+```sh
+mkt --root data/cn_futures ctp-futures import /mnt/d/ctp-mirror --symbols CU2610 --start 2026-09-01 --end 2026-10-01
+```
+
+导入日期按源包交易日筛选，可用 `mkt --root data/cn_futures ctp-futures check` 检查数据集。读取使用 `mktpack.open('data/cn_futures')['tick'].read(symbol='CU2610')`，可用 `columns` 指定所需列。
+
 ## 打包
 
 ```sh
 build/cli/mkt --root data/binance package packaged-data --max-file-size 128MiB --jobs 4
 ```
 
-可用 `--groups`、`--symbols`、`--start`、`--end` 筛选；普通表及其外置数据库完整保留。单个年度 MKP 或整月 SQLite 时序数据放不下时需调大分卷上限。
+可用 `--groups`、`--symbols`、`--start`、`--end` 筛选；普通表及其外置数据库完整保留。单个币安年度 MKP、期货 tick 合约月或整月 SQLite 时序数据放不下时需调大分卷上限。
 
 所有接受普通数据目录的地方都接受打包结果
 

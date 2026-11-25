@@ -105,9 +105,9 @@ struct DB:storage::Database {
         if(fs::exists(root/"funding.sqlite")) attach_funding();
     }
     void attach_funding() { exec("ATTACH DATABASE "+quote((root/"funding.sqlite").string())+" AS funding_data"); }
-    int64_t file_id(const std::string& group,const std::string& symbol,const std::string& name) {
-        storage::Statement query(*this,"SELECT f.id FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id WHERE g.name=? AND s.name=? AND f.name=?");
-        query.text(1,group); query.text(2,symbol); query.text(3,name); query.next();
+    int64_t file_id(const std::string& group,const std::string& symbol,int period) {
+        storage::Statement query(*this,"SELECT f.id FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id WHERE g.name=? AND s.name=? AND f.period=?");
+        query.text(1,group); query.text(2,symbol); query.integer(3,period); query.next();
         return query.integer(0);
     }
     Source source(const std::string& key,const std::string& group,const std::string& symbol,const std::string& period) {
@@ -162,7 +162,7 @@ struct DB:storage::Database {
             return count.integer(0)==state.integer(0);
         }
         sqlite3_stmt* statement;
-        const auto sql="SELECT s.file_id,s.error,g.name||'/'||t.name||'/'||f.name,"+
+        const auto sql="SELECT s.file_id,s.error,g.name||'/'||t.name||'/'||f.period||'.mkp',"+
             std::string(source.rest?"s.covered_until":"0")+",s.rows FROM "+source.table()+" s "
             "LEFT JOIN __timefile__ f ON f.id=s.file_id LEFT JOIN __group__ g ON g.id=f.group_id "
             "LEFT JOIN __symbols__ t ON t.id=f.symbol_id WHERE s."+source.key()+"=? AND s.period=?";
@@ -312,22 +312,11 @@ void register_file(DB& db, const fs::path& path, const Table& table) {
     db.exec("INSERT INTO __group__(name,kind,schema) VALUES("+quote(group)+",'timeseries',"+quote(schema.dump())+") "
             "ON CONFLICT(name) DO UPDATE SET schema=excluded.schema");
     const auto group_key=storage::group_id(db,group), symbol_key=storage::symbol_id(db,symbol);
-    db.exec("INSERT INTO __timefile__(group_id,symbol_id,name,first_time,last_time,rows) VALUES("+
-            std::to_string(group_key)+","+std::to_string(symbol_key)+","+quote(path.filename().string())+","+std::to_string(time.front())+","+
+    const auto period=std::stoi(path.stem().string());
+    db.exec("INSERT INTO __timefile__(group_id,symbol_id,period,first_time,last_time,rows) VALUES("+
+            std::to_string(group_key)+","+std::to_string(symbol_key)+","+std::to_string(period)+","+std::to_string(time.front())+","+
             std::to_string(time.back())+","+std::to_string(time.size())+") "
-            "ON CONFLICT(group_id,symbol_id,name) DO UPDATE SET first_time=excluded.first_time,last_time=excluded.last_time,rows=excluded.rows");
-}
-
-void set_taker_encoding(Table& table, const Options& options) {
-    if (!table.columns.contains("taker_buy_volume")) return;
-    auto& schema=table.schema["taker_buy_volume"];
-    if (options.lossy_taker) {
-        schema["encoding"]="ratio_1000";
-        schema["reference"]="volume";
-    } else {
-        schema.erase("encoding");
-        schema.erase("reference");
-    }
+            "ON CONFLICT(group_id,symbol_id,period) DO UPDATE SET first_time=excluded.first_time,last_time=excluded.last_time,rows=excluded.rows");
 }
 
 void consolidate(DB& db, const Options& options, const std::string& group, const std::string& symbol,const Reporter& progress={}) {
@@ -341,9 +330,9 @@ void consolidate(DB& db, const Options& options, const std::string& group, const
         const int year=std::stoi(stem.substr(0,4));
         if (sys_days{std::chrono::year{year+1}/1/1}<=today) {
             buckets[stem.substr(0,4)].push_back(entry.path());
-        } else if (stem.size()==10) {
-            const auto month=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{timestamp(stem.substr(0,7)+"-01")}})};
-            if (sys_days{month+months{1}}<=today) buckets[stem.substr(0,7)].push_back(entry.path());
+        } else if (stem.size()==8) {
+            const auto month=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{timestamp(stem.substr(0,6)+"01")}})};
+            if (sys_days{month+months{1}}<=today) buckets[stem.substr(0,6)].push_back(entry.path());
         }
     }
     for (auto& [period,paths]:buckets) {
@@ -353,14 +342,14 @@ void consolidate(DB& db, const Options& options, const std::string& group, const
         std::vector<Table> tables;
         for (const auto& path:paths) tables.push_back(read(path));
         auto table=merge(tables);
-        set_taker_encoding(table,options);
+        if (table.columns.contains("taker_buy_volume")) set_taker_encoding(table.schema,options.lossy_taker);
         write(destination,table);
         db.exec("BEGIN IMMEDIATE");
         register_file(db,destination,table);
-        const auto target=db.file_id(group,symbol,destination.filename().string());
+        const auto target=db.file_id(group,symbol,std::stoi(destination.stem().string()));
         for (const auto& path:paths) {
             if (path==destination) continue;
-            const auto old=db.file_id(group,symbol,path.filename().string());
+            const auto old=db.file_id(group,symbol,std::stoi(path.stem().string()));
             db.remap_file(old,target);
             db.exec("DELETE FROM __timefile__ WHERE id="+std::to_string(old));
         }
@@ -373,7 +362,9 @@ void store_source(DB& db, const Options& options, const std::string& group,
                   const std::string& symbol, const std::string& period,
                   const Source& source_id, Table table, int64_t covered_until=0) {
     const auto directory=options.root/group/symbol;
-    auto destination=directory/(period+".mkp");
+    auto local_period=period;
+    local_period.erase(std::remove(local_period.begin(),local_period.end(),'-'),local_period.end());
+    auto destination=directory/(local_period+".mkp");
     const auto begin=timestamp(period.size()==7?period+"-01":period);
     const auto date=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{begin}})};
     const auto end=duration_cast<milliseconds>((period.size()==7?sys_days{date+months{1}}:sys_days{date}+days{1}).time_since_epoch()).count();
@@ -393,9 +384,9 @@ void store_source(DB& db, const Options& options, const std::string& group,
             const auto path=entry.path();
             if (path.extension()!=".mkp") continue;
             const auto stem=path.stem().string();
-            if (stem==period || stem.starts_with(period+"-")) {
+            if (stem==local_period || (stem.size()>local_period.size() && stem.starts_with(local_period))) {
                 replaced.push_back(path);
-            } else if (period.starts_with(stem+"-")) {
+            } else if (local_period.size()>stem.size() && local_period.starts_with(stem)) {
                 auto previous=read(path);
                 const auto& times=previous.columns.at("time");
                 const auto a=std::lower_bound(times.begin(),times.end(),begin)-times.begin();
@@ -407,14 +398,14 @@ void store_source(DB& db, const Options& options, const std::string& group,
         }
     }
     auto combined=merge(tables);
-    set_taker_encoding(combined,options);
+    if (combined.columns.contains("taker_buy_volume")) set_taker_encoding(combined.schema,options.lossy_taker);
     write(destination,combined);
     db.exec("BEGIN IMMEDIATE");
     register_file(db,destination,combined);
-    const auto target=db.file_id(group,symbol,destination.filename().string());
+    const auto target=db.file_id(group,symbol,std::stoi(destination.stem().string()));
     for (const auto& path:replaced) {
         if(path==destination) continue;
-        const auto old=db.file_id(group,symbol,path.filename().string());
+        const auto old=db.file_id(group,symbol,std::stoi(path.stem().string()));
         db.remap_file(old,target);
         db.exec("DELETE FROM __timefile__ WHERE id="+std::to_string(old));
     }

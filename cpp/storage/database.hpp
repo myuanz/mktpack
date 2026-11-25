@@ -67,8 +67,9 @@ inline void create_index(Database& db) {
             "storage TEXT NOT NULL DEFAULT 'mkp',location TEXT NOT NULL DEFAULT '',table_name TEXT NOT NULL DEFAULT '',"
             "time_column TEXT NOT NULL DEFAULT 'time',symbol_column TEXT NOT NULL DEFAULT 'symbol_id');"
             "CREATE TABLE IF NOT EXISTS __symbols__(id INTEGER PRIMARY KEY,name TEXT UNIQUE);"
-            "CREATE TABLE IF NOT EXISTS __timefile__(id INTEGER PRIMARY KEY,group_id INTEGER,symbol_id INTEGER,name TEXT,first_time INTEGER,last_time INTEGER,rows INTEGER,volume INTEGER NOT NULL DEFAULT 0,UNIQUE(group_id,symbol_id,name));"
-            "CREATE TABLE IF NOT EXISTS __sqlite_partitions__(group_id INTEGER,start INTEGER,end INTEGER,volume INTEGER,rows INTEGER,first_time INTEGER,last_time INTEGER,PRIMARY KEY(group_id,start)) WITHOUT ROWID;");
+            "CREATE TABLE IF NOT EXISTS __volumes__(id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE);"
+            "CREATE TABLE IF NOT EXISTS __timefile__(id INTEGER PRIMARY KEY,group_id INTEGER NOT NULL,symbol_id INTEGER NOT NULL,period INTEGER NOT NULL,first_time INTEGER NOT NULL,last_time INTEGER NOT NULL,rows INTEGER NOT NULL,volume_id INTEGER,UNIQUE(group_id,symbol_id,period));"
+            "CREATE TABLE IF NOT EXISTS __sqlite_partitions__(group_id INTEGER,start INTEGER,end INTEGER,volume_id INTEGER,rows INTEGER,first_time INTEGER,last_time INTEGER,PRIMARY KEY(group_id,start)) WITHOUT ROWID;");
 }
 
 inline int64_t symbol_id(Database& db,const std::string& symbol) {
@@ -91,10 +92,15 @@ inline int64_t group_id(Database& db,const std::string& group) {
 class PayloadReader {
     Database& index;
     std::map<std::string,std::unique_ptr<Database>> volumes;
+    Database& volume(const std::string& path) {
+        auto& result=volumes[path];
+        if(!result) result=std::make_unique<Database>(index.root/std::filesystem::path(path));
+        return *result;
+    }
 public:
     explicit PayloadReader(Database& database):index(database) {}
-    std::vector<uint8_t> read(int64_t id, const std::string& path, int64_t volume_id) {
-        if (!volume_id) {
+    std::vector<uint8_t> read(int64_t id,const std::string& path,const std::string& volume_path) {
+        if (volume_path.empty()) {
             std::ifstream input(index.root/path,std::ios::binary|std::ios::ate);
             if (!input) throw std::runtime_error("无法读取："+(index.root/path).string());
             std::vector<uint8_t> bytes(input.tellg());
@@ -103,16 +109,31 @@ public:
             if (!input) throw std::runtime_error("载荷读取失败："+path);
             return bytes;
         }
-        const auto name="mkt.data."+std::to_string(volume_id);
-        auto& volume=volumes[name];
-        if (!volume) volume=std::make_unique<Database>(index.root/name);
-        Statement query(*volume,"SELECT bytes FROM blob WHERE id=?");
+        Statement query(volume(volume_path),"SELECT bytes FROM blob WHERE id=?");
         query.integer(1,id);
         if (!query.next()) throw std::runtime_error("分卷缺少载荷："+path);
         const auto* data=static_cast<const uint8_t*>(sqlite3_column_blob(query.statement,0));
         const auto size=sqlite3_column_bytes(query.statement,0);
         if (!size) throw std::runtime_error("分卷载荷为空："+path);
         return {data,data+size};
+    }
+    std::map<int64_t,std::vector<uint8_t>> read_volume(const std::string& path,const std::vector<int64_t>& ids) {
+        std::map<int64_t,std::vector<uint8_t>> result;
+        constexpr size_t batch=500;
+        for(size_t begin=0;begin<ids.size();begin+=batch) {
+            const auto end=std::min(ids.size(),begin+batch);
+            std::string sql="SELECT id,bytes FROM blob WHERE id IN (";
+            for(size_t i=begin;i<end;++i) sql+=(i==begin?"?":",?");
+            Statement query(volume(path),sql+")");
+            for(size_t i=begin;i<end;++i)query.integer(int(i-begin+1),ids[i]);
+            while(query.next()) {
+                const auto* data=static_cast<const uint8_t*>(sqlite3_column_blob(query.statement,1));
+                const auto size=sqlite3_column_bytes(query.statement,1);
+                result.emplace(query.integer(0),std::vector<uint8_t>(data,data+size));
+            }
+        }
+        if(result.size()!=ids.size()) throw std::runtime_error("分卷缺少载荷："+path);
+        return result;
     }
 };
 

@@ -2,11 +2,28 @@
 #include <mktpack/core.hpp>
 #include <functional>
 #include <limits>
+#include <optional>
 namespace mktpack {
 Json describe(const std::filesystem::path& root,const std::string& group="");
 Json ordinary(const std::filesystem::path& root,const std::string& group);
-struct ReadTable { Json columns, schema, metadata; };
-std::vector<ReadTable> query(const std::filesystem::path& root,const std::string& group,const std::vector<std::string>& symbols,int64_t start,int64_t end);
+// Arrow 数组的列类型、有效性位图、数据缓冲区及嵌套子列。
+struct ResultColumn {
+    std::string type;
+    int scale = 0;
+    size_t rows = 0;
+    std::vector<std::vector<uint8_t>> buffers;
+    std::vector<ResultColumn> children;
+};
+struct QueryResult {
+    size_t rows = 0;
+    std::vector<std::string> names;
+    std::vector<ResultColumn> columns;
+};
+using Projection = std::optional<std::vector<std::string>>;
+QueryResult query(const std::filesystem::path& root, const std::string& group,
+                  const std::vector<std::string>& symbols, int64_t start, int64_t end,
+                  const Projection& requested = {});
+QueryResult file_result(const std::filesystem::path& path);
 Json check_dataset(const std::filesystem::path& root);
 struct PackageOptions {
     std::vector<std::string> groups, symbols;

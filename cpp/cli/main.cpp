@@ -1,4 +1,5 @@
 #include <mktpack/binance.hpp>
+#include <mktpack/ctp_futures.hpp>
 #include <mktpack/storage.hpp>
 #include <CLI/CLI.hpp>
 #include <chrono>
@@ -38,6 +39,14 @@ int main(int argc, char** argv) {
     download->add_flag("--lossy-taker,!--no-lossy-taker", options.lossy_taker,
                        "主动买量按0.1个百分点量化（默认启用）");
     auto check=binance->add_subcommand("check");
+    mktpack::ctp_futures::Options ctp_options;
+    auto ctp=app.add_subcommand("ctp-futures","国内期货时序数据");
+    auto check_ctp=ctp->add_subcommand("check","检查数据集索引与载荷");
+    auto import_ticks=ctp->add_subcommand("import","导入镜像中的完整期货 tick ZIP");
+    import_ticks->add_option("mirror",ctp_options.mirror,"包含 nfs_rq*/tick/future 的镜像目录")->required();
+    import_ticks->add_option("--start",ctp_options.start,"起始交易日（含）");
+    import_ticks->add_option("--end",ctp_options.end,"结束交易日（不含）");
+    import_ticks->add_option("--symbols",ctp_options.symbols,"标准合约代码")->expected(-1);
     auto packing=app.add_subcommand("package","打包为 SQLite 载荷分卷");
     std::string destination, maximum="128MiB", package_start, package_end;
     mktpack::PackageOptions package_options;
@@ -63,6 +72,9 @@ int main(int argc, char** argv) {
             mktpack::cli::DownloadProgress progress(options.jobs);
             options.progress=[&](const auto& event) { progress.update(event); };
             mktpack::binance::download(options);
+        } else if (*import_ticks) {
+            ctp_options.root=root;
+            std::cout<<mktpack::ctp_futures::import_ticks(ctp_options).dump(2)<<"\n";
         } else if (*packing) {
             package_options.max_file_size=file_size(maximum);
             if (!package_start.empty()) package_options.start=mktpack::binance::timestamp(package_start);
@@ -71,7 +83,7 @@ int main(int argc, char** argv) {
             const auto result=mktpack::package(root,destination,package_options);
             for (const auto& warning:result.at("warnings")) std::cerr<<"警告："<<warning.get<std::string>()<<"\n";
             std::cout<<result.dump(2)<<"\n";
-        } else if (*check) {
+        } else if (*check || *check_ctp) {
             auto result=mktpack::check_dataset(root);
             std::cout << result.dump(2) << "\n";
             return result["errors"].empty()?0:1;

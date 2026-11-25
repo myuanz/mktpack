@@ -35,6 +35,66 @@ int main() {
         for (size_t i=0;i<3;++i) expect(decoded.columns.at(name)[i]==table.columns.at(name)[i]*10,"OHLC精确缩放错误");
     }
 
+    for (const auto& name:{"open","high","low","close"}) {
+        auto projection=decode(encode(mixed),{name});
+        expect(projection.columns.size()==1 && projection.columns.at(name)==decoded.columns.at(name),"OHLC列投影错误");
+    }
+    auto quantized=table;
+    quantized.columns["volume"]={10,0,34};
+    quantized.schema["volume"]={{"type","integer"},{"scale",0}};
+    quantized.schema["taker_buy_volume"]={{"type","integer"},{"encoding","ratio_1000"},{"reference","volume"}};
+    auto ratio=encode(quantized);
+    expect(decode(ratio,{"taker_buy_volume"}).columns.at("taker_buy_volume")==decode(ratio).columns.at("taker_buy_volume"),
+           "比例列投影缺少参照量");
+
+    Table day;
+    day.columns={{"time",{0,0,250,500}},{"period",{20261002,20261002,20261002,20261002}},
+                 {"price",{100,110,110,0}},{"p1",{1050,950,1040,0}},{"p2",{95,90,95,0}},
+                 {"q1",{8,9,10,0}},{"q2",{7,5,11,0}},{"volume",{5,6,9,9}},{"amount",{500,610,940,940}},
+                 {"bounds",{INT64_MIN,INT64_MAX,0,0}}};
+    day.metadata={{"symbol","X2610"}};
+    for (const auto& [name,values]:day.columns) day.schema[name]={{"type",name=="time"?"timestamp":"integer"}};
+    for (const auto& name:{"price","p1","p2"}) day.schema[name]={{"type","decimal"},{"scale_group","quotes"},{"scale",1}};
+    day.schema["p1"]["scale"]=2;
+    day.schema["p1"]["prediction"]={{"kind","reference"},{"column","price"}};
+    day.schema["p2"]["prediction"]={{"kind","reference"},{"column","p1"}};
+    for (const auto& name:{"q1","q2"})
+        day.schema[name]["prediction"]={{"kind","level_quantity"},{"price",name==std::string("q1")?"p1":"p2"},
+                                      {"prices",{"p1","p2"}},{"quantities",{"q1","q2"}}};
+    day.schema["amount"]["prediction"]={{"kind","trade_value"},{"price","price"},{"volume","volume"}};
+    auto block=encode(day);
+    const auto block_info=info(block);
+    expect(block_info["version"]==1,"预测编码改变了格式版本");
+    Columns expected=day.columns;
+    for (auto n:{"price","p2"}) for (auto& x:expected[n]) x*=10;
+    expect(decode(block).columns==expected,"多列预测日块往返错误");
+    expect(decode(encode(decode(block))).columns==expected,"日块重编码发生变化");
+    for (const auto& [name,values]:expected) {
+        expect(decode(block,{name}).columns==Columns{{name,values}},"单列预测依赖错误");
+    }
+    expect(decode(block,{}).columns.empty(),"空投影错误");
+    size_t offset=12;
+    for (unsigned i=0;i<4;++i) offset+=size_t(block[8+i])<<(8*i);
+    for (const auto& d:block_info.at("columns")) {
+        if (d.at("name")=="period") expect(d.at("size")==0,"常量不应写入压缩帧");
+        if (d.at("name")=="bounds") block[offset]=0;
+        offset+=d.at("size").get<size_t>();
+    }
+    expect(decode(block,{"q1"}).columns.at("q1")==day.columns.at("q1"),"列投影不应解压无关帧");
+    Table sparse;
+    sparse.schema={{"time",{{"type","timestamp"}}},{"value",{{"type","integer"}}}};
+    int64_t level=17;
+    uint32_t state=1234;
+    for (int i=0;i<30000;++i) {
+        state=state*1664525u+1013904223u;
+        if ((state>>24)<3) level+=int((state>>10)%12345)-6000;
+        sparse.columns["time"].push_back(i*500);
+        sparse.columns["value"].push_back(level);
+    }
+    const auto rare=encode(sparse);
+    expect(info(rare)["columns"][1]["transform"]=="changes","稀疏变更未压缩");
+    expect(decode(rare).columns==sparse.columns,"稀疏变更往返错误");
+
     auto empty=table;
     for (auto& [name,values]:empty.columns) values.clear();
     expect(decode(encode(empty)).columns==empty.columns,"空表往返失败");
@@ -44,7 +104,5 @@ int main() {
     bounds.schema={{"time",{{"type","timestamp"}}},{"value",{{"type","integer"}}}};
     expect(decode(encode(bounds)).columns==bounds.columns,"int64边界往返失败");
     bounds.columns["time"]={INT64_MIN,INT64_MAX};
-    rejected=false;
-    try { encode(bounds); } catch (const std::runtime_error&) { rejected=true; }
-    expect(rejected,"差分溢出未拒绝");
+    expect(decode(encode(bounds)).columns==bounds.columns,"时间差分溢出未回退直接编码");
 }

@@ -87,7 +87,7 @@ def test_sqlite_whole_month_volumes(monthly_sqlite, tmp_path):
     assert result['volumes'] == 2
     assert all(p.stat().st_size <= limit for p in packed.glob('mkt.data.*'))
     with sqlite3.connect(packed / 'mkt.sqlite') as db:
-        parts = db.execute('SELECT start,end,volume,rows FROM __sqlite_partitions__ ORDER BY start').fetchall()
+        parts = db.execute('SELECT start,end,volume_id,rows FROM __sqlite_partitions__ ORDER BY start').fetchall()
     assert parts == [(milliseconds('2024-01-01'), milliseconds('2024-02-01'), 1, 400),
                      (milliseconds('2024-02-01'), milliseconds('2024-03-01'), 2, 400)]
     original = mktpack.open(root)['settlements']
@@ -116,10 +116,11 @@ def test_sqlite_and_blob_share_volume(monthly_sqlite, tmp_path):
     packed = tmp_path / 'mixed'
     run_package(monthly_sqlite, packed)
     with sqlite3.connect(packed / 'mkt.sqlite') as db:
-        funding_volume = db.execute('SELECT volume FROM __sqlite_partitions__ LIMIT 1').fetchone()[0]
+        funding_volume = db.execute('SELECT volume_id FROM __sqlite_partitions__ LIMIT 1').fetchone()[0]
+        funding_path = db.execute('SELECT path FROM __volumes__ WHERE id=?', (funding_volume,)).fetchone()[0]
         table = db.execute("SELECT table_name FROM __group__ WHERE name='settlements'").fetchone()[0]
-        assert db.execute('SELECT count(*) FROM __timefile__ WHERE volume=?', (funding_volume,)).fetchone()[0] > 0
-    with sqlite3.connect(packed / f'mkt.data.{funding_volume}') as volume:
+        assert db.execute('SELECT count(*) FROM __timefile__ WHERE volume_id=?', (funding_volume,)).fetchone()[0] > 0
+    with sqlite3.connect(packed / funding_path) as volume:
         assert volume.execute('SELECT count(*) FROM blob').fetchone()[0] > 0
         assert volume.execute(f'SELECT count(*) FROM {table}').fetchone()[0] == 800
     check_package(packed)
@@ -151,7 +152,7 @@ def test_check_sqlite_volume_damage(monthly_sqlite, tmp_path, damage):
             volume.execute(f'DELETE FROM {table}')
     else:
         with sqlite3.connect(packed / 'mkt.sqlite') as db:
-            db.execute('UPDATE __sqlite_partitions__ SET volume=999')
+            db.execute('UPDATE __sqlite_partitions__ SET volume_id=999')
     result = subprocess.run([shutil.which('mkt'), '--root', str(packed), 'binance', 'check'], capture_output=True, text=True)
     assert result.returncode == 1
     assert json.loads(result.stdout)['errors']
@@ -168,7 +169,7 @@ def test_real_funding_volumes(tmp_path, real_dataset):
     assert all(p.stat().st_size <= 32768 for p in packed.glob('mkt.data.*'))
     assert mktpack.open(packed)['funding_rate_settlement'].read().equals(original)
     with sqlite3.connect(packed / 'mkt.sqlite') as db:
-        parts = db.execute('SELECT start,end,volume,rows FROM __sqlite_partitions__ ORDER BY start').fetchall()
+        parts = db.execute('SELECT start,end,volume_id,rows FROM __sqlite_partitions__ ORDER BY start').fetchall()
         assert sum(p[3] for p in parts) == original.num_rows
         assert len(parts) == len(set(p[0] for p in parts))
     check_package(packed)

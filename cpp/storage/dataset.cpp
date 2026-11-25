@@ -1,6 +1,9 @@
 #include <mktpack/storage.hpp>
-#include "sqlite.hpp"
+#include "result.hpp"
 #include <algorithm>
+#include <atomic>
+#include <future>
+#include <map>
 #include <set>
 
 namespace mktpack {
@@ -56,50 +59,118 @@ Json ordinary(const std::filesystem::path& root, const std::string& group) {
     return rows.empty()?Json::object():rows.size()==1?rows[0]:rows;
 }
 
-std::vector<ReadTable> query(const std::filesystem::path& root, const std::string& group,
-                         const std::vector<std::string>& symbols, int64_t start, int64_t end) {
+namespace {
+std::vector<std::string> output_names(const Json& schema, bool symbol, const Projection& requested) {
+    if (requested) {
+        for (const auto& name : *requested)
+            if (!schema.contains(name) && !(symbol && name=="symbol"))
+                throw std::out_of_range("未知列："+name);
+        return *requested;
+    }
+    std::vector<std::string> names;
+    for (const auto& [name,field] : schema.items())
+        if (!symbol || name!="symbol") names.push_back(name);
+    if (symbol) names.emplace_back("symbol");
+    return names;
+}
+}
+
+QueryResult file_result(const std::filesystem::path& path) {
+    const auto header=info(path);
+    Json schema=Json::object();
+    for (const auto& column : header.at("columns"))
+        schema[column.at("name").get<std::string>()]=column;
+    auto physical=output_names(schema,false,{});
+    auto names=output_names(schema,!header.value("symbol","").empty(),{});
+    return mkp_result({read(path)},schema,std::move(names));
+}
+
+QueryResult query(const std::filesystem::path& root, const std::string& group,
+                  const std::vector<std::string>& symbols, int64_t start, int64_t end,
+                  const Projection& requested) {
     Database database(root);
     const auto spec=group_spec(database,group);
+    auto names=output_names(spec.schema,spec.storage=="mkp",requested);
     if(spec.storage=="sqlite") {
         SqlReader reader(database,spec);
-        return {reader.query(start,end,symbols)};
+        return sql_result(reader,database,symbols,start,end,std::move(names));
     }
+    std::set<std::string> fields(names.begin(),names.end());
+    fields.erase("symbol");
+    fields.insert("time");
+    const std::vector<std::string> physical(fields.begin(),fields.end());
+    struct Entry {std::string symbol,path,volume;int64_t id;};
+    std::vector<Entry> entries;
     PayloadReader reader(database);
-    Statement files(database,"SELECT s.name,g.name||'/'||s.name||'/'||f.name,f.id,f.volume FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id WHERE g.name=? "
-                             "AND first_time<? AND last_time>=? ORDER BY s.name,first_time,f.name");
-    files.text(1,group);
-    sqlite3_bind_int64(files.statement,2,end);
-    sqlite3_bind_int64(files.statement,3,start);
-    std::map<std::string,std::vector<Table>> grouped;
-    while (files.next()) {
-        const auto symbol=files.text(0);
-        if (!symbols.empty() && std::find(symbols.begin(),symbols.end(),symbol)==symbols.end()) continue;
-        auto table=decode(reader.read(files.integer(2),files.text(1),files.integer(3)));
-        slice(table,start,end);
-        if (table.columns.at("time").empty()) continue;
-        grouped[symbol].push_back(std::move(table));
+    std::string sql="SELECT s.name,g.name||'/'||s.name||'/'||f.period||'.mkp',f.id,coalesce(v.path,'') "
+                    "FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id "
+                    "LEFT JOIN __volumes__ v ON v.id=f.volume_id WHERE g.name=? AND first_time<? AND last_time>=?";
+    if(!symbols.empty()) {
+        sql+=" AND s.name IN (";
+        for(size_t i=0;i<symbols.size();++i)sql+=(i?",?":"?");
+        sql+=")";
     }
-    std::vector<ReadTable> result;
-    for (const auto& [symbol,tables]:grouped) {
-        auto table=merge(tables);
-        result.push_back({table.columns,table.schema,table.metadata});
+    Statement files(database,sql+" ORDER BY s.name,first_time,f.period,f.id");
+    files.text(1,group); files.integer(2,end); files.integer(3,start);
+    for(size_t i=0;i<symbols.size();++i)files.text(int(i+4),symbols[i]);
+    while (start<end && files.next()) {
+        entries.push_back({files.text(0),files.text(1),files.text(3),files.integer(2)});
     }
-    return result;
+    std::map<std::string,std::vector<int64_t>> grouped;
+    for(const auto& entry:entries)if(!entry.volume.empty())grouped[entry.volume].push_back(entry.id);
+    std::map<std::string,std::map<int64_t,std::vector<uint8_t>>> loaded;
+    for(const auto& [volume,ids]:grouped)loaded.emplace(volume,reader.read_volume(volume,ids));
+    std::vector<std::vector<uint8_t>> payloads(entries.size());
+    for(size_t i=0;i<entries.size();++i) {
+        const auto& entry=entries[i];
+        payloads[i]=entry.volume.empty()?reader.read(entry.id,entry.path,{}):std::move(loaded.at(entry.volume).at(entry.id));
+    }
+    std::vector<Table> decoded(entries.size());
+    std::atomic_size_t next{0};
+    auto decode_next=[&] {
+        for(size_t i=next++;i<entries.size();i=next++) {
+            auto table=decode(payloads[i],physical);
+            const auto& time=table.columns.at("time");
+            if(!time.empty() && (time.front()<start || time.back()>=end))slice(table,start,end);
+            if(!table.columns.at("time").empty())table.metadata["symbol"]=entries[i].symbol;
+            decoded[i]=std::move(table);
+        }
+    };
+    std::vector<std::future<void>> workers;
+    for(size_t i=1;i<std::min<size_t>(4,entries.size());++i)
+        workers.push_back(std::async(std::launch::async,decode_next));
+    decode_next();
+    for(auto& worker:workers)worker.get();
+    std::vector<Table> tables;
+    for(auto& table:decoded) {
+        auto found=table.columns.find("time");
+        if(found!=table.columns.end() && !found->second.empty())tables.push_back(std::move(table));
+    }
+    return mkp_result(std::move(tables),spec.schema,std::move(names));
 }
 
 Json check_dataset(const std::filesystem::path& root) {
     Database database(root);
     PayloadReader reader(database);
-    Statement files(database,"SELECT f.id,g.name||'/'||s.name||'/'||f.name,first_time,last_time,rows,volume FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id ORDER BY f.id");
     Json errors=Json::array();
+    {
+        Statement missing(database,"SELECT 'timefile',id FROM __timefile__ f WHERE volume_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM __volumes__ v WHERE v.id=f.volume_id) "
+                                   "UNION ALL SELECT 'sqlite',group_id FROM __sqlite_partitions__ p WHERE volume_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM __volumes__ v WHERE v.id=p.volume_id)");
+        while(missing.next())errors.push_back(missing.text(0)+" 卷映射不存在："+std::to_string(missing.integer(1)));
+    }
+    Statement files(database,"SELECT f.id,g.name||'/'||s.name||'/'||f.period||'.mkp',first_time,last_time,rows,coalesce(v.path,'') "
+                             "FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id "
+                             "LEFT JOIN __volumes__ v ON v.id=f.volume_id ORDER BY f.id");
     size_t count=0;
     while (files.next()) {
         const auto path=files.text(1);
         try {
-            const auto table=decode(reader.read(files.integer(0),path,files.integer(5)));
+            const auto bytes=reader.read(files.integer(0),path,files.text(5));
+            const auto table=decode(bytes);
             const auto& time=table.columns.at("time");
-            if (time.empty() || time.front()!=files.integer(2) || time.back()!=files.integer(3)
-                || time.size()!=size_t(files.integer(4))) errors.push_back(path);
+            const bool valid=!time.empty() && time.size()==size_t(files.integer(4)) && time.front()==files.integer(2) &&
+                             time.back()==files.integer(3) && std::is_sorted(time.begin(),time.end());
+            if(!valid) errors.push_back({{"path",path},{"error","索引不一致"}});
         } catch (const std::exception& error) {
             errors.push_back(path+": "+error.what());
         }
@@ -116,7 +187,7 @@ Json check_dataset(const std::filesystem::path& root) {
                 check.next();
                 continue;
             }
-            std::set<int64_t> checked;
+            std::set<std::string> checked;
             for(const auto& part:reader.partitions()) {
                 if(checked.insert(part.volume).second) {
                     Statement integrity(reader.database(part.volume),"PRAGMA quick_check("+identifier(spec.table)+")");

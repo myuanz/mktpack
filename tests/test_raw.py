@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, localcontext
 import pyarrow as pa
 import pytest
 from mktpack import raw
@@ -14,6 +14,55 @@ def test_exact_roundtrip(tmp_path):
     assert restored["symbol"].equals(table["symbol"])
 
 
+def test_sliced_chunks_preserve_exact_values(tmp_path):
+    clock = pa.array([-1000, 0, 2000, 5000], type=pa.timestamp("us", tz="Asia/Shanghai"))
+    prices = pa.array([None, Decimal("-12345.67"), Decimal("0.01"), Decimal("98765.43")],
+                      type=pa.decimal128(7, 2))
+    contracts = pa.array(["OTHER", "CU2610", "CU2610", "CU2610"], type=pa.large_string())
+    table = pa.table({
+        "time": pa.chunked_array([clock.slice(1, 2), clock.slice(3)]),
+        "price": pa.chunked_array([prices.slice(1, 1), prices.slice(2)]),
+        "quantity": pa.array([0, 2**31, 2**32-1], type=pa.uint32()),
+        "symbol": pa.chunked_array([contracts.slice(1, 2), contracts.slice(3)]),
+    })
+    path = tmp_path / "chunks.mkp"
+    with localcontext() as context:
+        context.prec = 3
+        raw.write(path, table)
+    restored = raw.read(path)
+    assert restored["price"].to_pylist() == table["price"].to_pylist()
+    assert restored["time"].type == pa.timestamp("ms", tz="UTC")
+    assert restored["time"].cast(pa.int64()).to_pylist() == [0, 2, 5]
+    assert restored["quantity"].to_pylist() == [0, 2**31, 2**32-1]
+    assert restored["symbol"].to_pylist() == ["CU2610"]*3
+
+
+def test_symbol_must_be_constant_across_chunks(tmp_path):
+    table = pa.table({"time": [0, 1], "symbol": pa.chunked_array([["CU2610"], ["CU2611"]])})
+    with pytest.raises(ValueError):
+        raw.write(tmp_path / "symbols.mkp", table)
+
+
+def test_numeric_strings_and_floats(tmp_path):
+    table = pa.table({
+        "time": [1, 2],
+        "text": pa.chunked_array([["1e2"], ["-0.000210"]]),
+        "real": [0.1, -2.75],
+    })
+    path = tmp_path / "values.mkp"
+    raw.write(path, table)
+    restored = raw.read(path)
+    assert restored["text"].type.scale == 6
+    assert restored["text"].to_pylist() == [Decimal("100"), Decimal("-0.00021")]
+    assert restored["real"].to_pylist() == [Decimal("0.1"), Decimal("-2.75")]
+
+
+def test_timestamp_rejects_submillisecond_precision(tmp_path):
+    table = pa.table({"time": pa.array([1001], type=pa.timestamp("us"))})
+    with pytest.raises(ValueError):
+        raw.write(tmp_path / "clock.mkp", table)
+
+
 def test_schema_rescale(tmp_path):
     path = tmp_path / "data.mkp"
     table = pa.table({"time": [1], "value": [Decimal("1.23")]})
@@ -21,6 +70,11 @@ def test_schema_rescale(tmp_path):
     assert raw.read(path)["value"][0].as_py() == Decimal("1.2300")
     with pytest.raises(ValueError):
         raw.write(path, table, schema={"time": {"type": "timestamp", "scale": 0}, "value": {"type": "decimal", "scale": 1}})
+
+    value = Decimal("12345678901234.120000000000000")
+    table = pa.table({"time": [1], "value": pa.array([value], type=pa.decimal128(30, 15))})
+    raw.write(path, table, schema={"time": {"type": "timestamp"}, "value": {"type": "decimal", "scale": 2}})
+    assert raw.read(path)["value"][0].as_py() == value
 
 
 def test_empty_and_int64_bounds(tmp_path):
@@ -49,7 +103,7 @@ def test_lossy_ratio_and_repeated_merge(tmp_path):
     assert restored["taker_buy_volume"].to_pylist() == [Decimal(v) for v in ["0", ".333", ".000333", ".001", "1"]]
     assert restored["volume"].to_pylist() == table["volume"].to_pylist()
     assert raw.info(lossless)["version"] == 1
-    assert raw.info(path)["version"] == 2
+    assert raw.info(path)["version"] == 1
     assert raw.info(path)["metadata"]["lossy_columns"]["taker_buy_volume"]["ratio_step"] == .001
     for i in range(3):
         merged = tmp_path / f"merged-{i}.mkp"

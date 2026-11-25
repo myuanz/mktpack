@@ -1,3 +1,4 @@
+#include <cstring>
 #include "../cpp/port/binance.cpp"
 #include <mktpack/storage.hpp>
 
@@ -204,7 +205,7 @@ int main() {
         };
         fetch(begin+4*3600000,begin);
         const auto nodes=count("__binance_datavision_paths__");
-        auto day_rows=[&] { return mktpack::query(rest_options.root,"funding_rate_settlement",{"BTCUSDT"},begin,begin+86400000).at(0).columns.at("time").size(); };
+        auto day_rows=[&] { return mktpack::query(rest_options.root,"funding_rate_settlement",{"BTCUSDT"},begin,begin+86400000).rows; };
         expect(day_rows()==1,"REST 首次局部下载失败");
         fetch(begin+24*3600000,begin+8*3600000);
         expect(day_rows()==3,"REST 延长终点未补齐同一天或丢失早期记录");
@@ -227,8 +228,11 @@ int main() {
         rest_options.groups={"funding_rate_settlement"};
         rest_options.start=begin; rest_options.end=timestamp("2024-02-01");
         download(rest_options);
-        auto funding=mktpack::query(rest_options.root,"funding_rate_settlement",{"BTCUSDT"},begin,rest_options.end).at(0);
-        expect(funding.columns.at("funding_rate")==Json::array({12345,-20000}),"月归档未精确替换 REST 数据");
+        auto funding=mktpack::query(rest_options.root,"funding_rate_settlement",{"BTCUSDT"},begin,rest_options.end,std::vector<std::string>{"funding_rate"});
+        __int128 coefficients[2];
+        expect(funding.rows==2 && funding.columns.at(0).buffers.at(1).size()==sizeof(coefficients),"资金费率条数错误");
+        std::memcpy(coefficients,funding.columns[0].buffers[1].data(),sizeof(coefficients));
+        expect(coefficients[0]==12345 && coefficients[1]==-20000,"月归档未精确替换 REST 数据");
         auto before=requests;
         download(rest_options);
         expect(requests-before==1,"资金费率增量重复下载");

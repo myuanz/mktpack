@@ -1,9 +1,10 @@
 #include <mktpack/decimal.hpp>
 #include <charconv>
+#include <limits>
 #include <stdexcept>
 
 namespace mktpack {
-DecimalInteger decimal_integer(std::string s) {
+DecimalInteger decimal_integer(std::string s, int* literal_scale) {
     bool negative=!s.empty() && s[0]=='-';
     if(!s.empty() && (s[0]=='-' || s[0]=='+')) s.erase(0,1);
     auto e=s.find_first_of("eE"); int exponent=0;
@@ -17,11 +18,15 @@ DecimalInteger decimal_integer(std::string s) {
     auto dot=s.find('.'); int64_t decimals=dot==std::string::npos?0:static_cast<int64_t>(s.size()-dot-1);
     if(dot!=std::string::npos) s.erase(dot,1);
     if(s.empty() || s.find_first_not_of("0123456789")!=std::string::npos) throw std::runtime_error("数值必须是有限十进制数");
+    decimals-=exponent;
+    if(literal_scale) {
+        if(decimals>std::numeric_limits<int>::max()) throw std::runtime_error("小数位数超出范围");
+        *literal_scale=decimals>0?static_cast<int>(decimals):0;
+    }
     auto nonzero=s.find_first_not_of('0');
     if(nonzero==std::string::npos) return {0,0};
     s.erase(0,nonzero);
     while(s.back()=='0') { s.pop_back(); --decimals; }
-    decimals-=exponent;
     if(decimals>18 || decimals < -18) throw std::runtime_error("十进制数超出精度或 int64 范围");
     uint64_t unsigned_value=0; auto parsed=std::from_chars(s.data(),s.data()+s.size(),unsigned_value);
     if(parsed.ec!=std::errc{} || parsed.ptr!=s.data()+s.size()) throw std::runtime_error("十进制整数超出范围");

@@ -2,7 +2,6 @@ import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 import pyarrow as pa
-import pyarrow.compute as pc
 from . import _native, raw
 
 
@@ -28,20 +27,9 @@ class Group:
         return json.loads(_native.describe(self.root, self.name))
 
     def read(self, *, symbol: str | None = None, symbols: list[str] | None = None, start=None, end=None, columns: list[str] | None = None) -> pa.Table:
-        batches = _native.query(self.root, self.name, symbols or ([symbol] if symbol else []), _time(start, -(2**63)), _time(end, 2**63 - 1))
-        tables = [raw._table(*t) for t in batches]
-        if tables:
-            scales = {f.name: max(t.schema.field(f.name).type.scale for t in tables) for f in tables[0].schema if pa.types.is_decimal(f.type)}
-            schema = pa.schema([pa.field(f.name, pa.decimal128(38, scales[f.name]) if f.name in scales else f.type) for f in tables[0].schema])
-            result = pa.concat_tables([t.cast(schema) for t in tables])
-            time_column = json.loads(batches[0][2]).get("time_column", "time")
-            result = result.take(pc.sort_indices(result, sort_keys=[(time_column, "ascending")]))
-        else:
-            fields = self.describe()["schema"]
-            result = pa.table({name: pa.array([], type=raw._type(s)) for name, s in fields.items()})
-            if 'symbol' not in fields:
-                result = result.append_column('symbol', pa.array([], type=pa.string()))
-        return result.select(columns) if columns is not None else result
+        data = _native.query(self.root, self.name, symbols or ([symbol] if symbol else []),
+                             _time(start, -(2**63)), _time(end, 2**63 - 1), columns)
+        return raw._table(*data)
 
 
 class Dataset:

@@ -38,13 +38,13 @@ def milliseconds(text):
     return int(datetime.fromisoformat(text).replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
-def add_file(root, db, group, symbol, name, times, values=None, *, lossy=False, quantities=None):
+def add_file(root, db, group, symbol, period, times, values=None, *, lossy=False, quantities=None):
     columns = {'time': pa.array(times, type=pa.timestamp('ms', tz='UTC'))}
     if quantities is None:
         columns['value'] = [Decimal(v) for v in values]
     else:
         columns.update({key: [Decimal(v) for v in numbers] for key, numbers in quantities.items()})
-    relative = f'{group}/{symbol}/{name}.mkp'
+    relative = f'{group}/{symbol}/{period}.mkp'
     raw.write(root / relative, pa.table(columns), metadata={'group': group, 'symbol': symbol}, lossy_taker=lossy)
     h = raw.info(root / relative)
     db.execute('INSERT OR IGNORE INTO __group__(name,kind) VALUES (?, ?)', (group, 'timeseries'))
@@ -56,8 +56,8 @@ def add_file(root, db, group, symbol, name, times, values=None, *, lossy=False, 
     db.execute('INSERT OR IGNORE INTO __symbols__(name) VALUES (?)', (symbol,))
     symbol_id = db.execute('SELECT id FROM __symbols__ WHERE name=?', (symbol,)).fetchone()[0]
     group_id = db.execute('SELECT id FROM __group__ WHERE name=?', (group,)).fetchone()[0]
-    db.execute('INSERT INTO __timefile__(group_id,symbol_id,name,first_time,last_time,rows) VALUES (?,?,?,?,?,?)',
-               (group_id, symbol_id, name + '.mkp', h['first_time'], h['last_time'], h['rows']))
+    db.execute('INSERT INTO __timefile__(group_id,symbol_id,period,first_time,last_time,rows) VALUES (?,?,?,?,?,?)',
+               (group_id, symbol_id, int(period), h['first_time'], h['last_time'], h['rows']))
     db.commit()
     return root / relative
 
@@ -70,9 +70,10 @@ def source(tmp_path):
     db.executescript('''
         PRAGMA journal_mode=WAL;
         CREATE TABLE __group__(id INTEGER PRIMARY KEY,name TEXT UNIQUE,kind TEXT,schema TEXT NOT NULL DEFAULT '{}',storage TEXT NOT NULL DEFAULT 'mkp',location TEXT NOT NULL DEFAULT '',table_name TEXT NOT NULL DEFAULT '',time_column TEXT NOT NULL DEFAULT 'time',symbol_column TEXT NOT NULL DEFAULT 'symbol_id');
-        CREATE TABLE __sqlite_partitions__(group_id INTEGER,start INTEGER,end INTEGER,volume INTEGER,rows INTEGER,first_time INTEGER,last_time INTEGER,PRIMARY KEY(group_id,start)) WITHOUT ROWID;
+        CREATE TABLE __sqlite_partitions__(group_id INTEGER,start INTEGER,end INTEGER,volume_id INTEGER,rows INTEGER,first_time INTEGER,last_time INTEGER,PRIMARY KEY(group_id,start)) WITHOUT ROWID;
         CREATE TABLE __symbols__(id INTEGER PRIMARY KEY,name TEXT UNIQUE);
-        CREATE TABLE __timefile__(id INTEGER PRIMARY KEY,group_id INTEGER,symbol_id INTEGER,name TEXT,first_time INTEGER,last_time INTEGER,rows INTEGER,volume INTEGER NOT NULL DEFAULT 0,UNIQUE(group_id,symbol_id,name));
+        CREATE TABLE __volumes__(id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE);
+        CREATE TABLE __timefile__(id INTEGER PRIMARY KEY,group_id INTEGER NOT NULL,symbol_id INTEGER NOT NULL,period INTEGER NOT NULL,first_time INTEGER NOT NULL,last_time INTEGER NOT NULL,rows INTEGER NOT NULL,volume_id INTEGER,UNIQUE(group_id,symbol_id,period));
         CREATE TABLE exchangeinfo(timezone TEXT,symbols TEXT);
         INSERT INTO __group__(name,kind,storage) VALUES ('exchangeinfo','ordinary','sqlite');
         INSERT INTO exchangeinfo VALUES ('UTC','[{"symbol":"BTCUSDT"},{"symbol":"DOGEUSDT"}]');
@@ -94,9 +95,9 @@ def source(tmp_path):
     for symbol in ['BTCUSDT', 'DOGEUSDT']:
         values = [str(Decimal(int(v)) / 1000) for v in rng.integers(0, 2**32, len(times))]
         add_file(root, db, 'kline', symbol, '2024', times, values)
-    add_file(root, db, 'kline', 'BTCUSDT', '2025-01', [milliseconds('2025-01-01')], ['1.23'])
+    add_file(root, db, 'kline', 'BTCUSDT', 202501, [milliseconds('2025-01-01')], ['1.23'])
     duplicate = milliseconds('2025-02-01')
-    add_file(root, db, 'kline', 'BTCUSDT', '2025-02', [duplicate, duplicate], ['2.345', '3.456'])
+    add_file(root, db, 'kline', 'BTCUSDT', 202502, [duplicate, duplicate], ['2.345', '3.456'])
     add_file(root, db, 'kline', 'BTCUSDT', '2026', [milliseconds('2026-01-01')], ['4.56789'])
     add_file(root, db, 'oi', 'BTCUSDT', '2024', [milliseconds('2024-01-01')], ['12'])
     # 保持连接，验证 SQLite backup 能复制尚在 WAL 中的索引和普通表
@@ -106,10 +107,10 @@ def source(tmp_path):
 
 def payloads(root):
     with sqlite3.connect(root / 'mkt.sqlite') as db:
-        rows = db.execute("SELECT g.name||'/'||s.name||'/'||f.name,f.volume,f.id FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id").fetchall()
+        rows = db.execute("SELECT g.name||'/'||s.name||'/'||f.period||'.mkp',v.path,f.id FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id JOIN __volumes__ v ON v.id=f.volume_id").fetchall()
     result = {}
     for path, volume, identifier in rows:
-        with sqlite3.connect(root / f'mkt.data.{volume}') as db:
+        with sqlite3.connect(root / volume) as db:
             result[path] = db.execute('SELECT bytes FROM blob WHERE id=?', (identifier,)).fetchone()[0]
     return result
 
@@ -137,7 +138,7 @@ def test_package_volumes_repack_and_index_path(source, tmp_path):
     before = {p: p.read_bytes() for p in root.rglob('*.mkp')}
     destination = tmp_path / 'packed'
     result = run_package(root / 'mkt.sqlite', destination, max_file_size=32768)
-    assert result['files'] == 5 and result['copied'] == 4 and result['reencoded'] == 1
+    assert result['files'] == 6 and result['copied'] == 6 and result['reencoded'] == 0
     assert result['volumes'] >= 2
     assert len(list(destination.glob('mkt.data.*'))) == result['volumes']
     assert all(p.stat().st_size <= 32768 for p in destination.glob('mkt.data.*'))
@@ -163,7 +164,7 @@ def test_package_volumes_repack_and_index_path(source, tmp_path):
     assert merged['value'].to_pylist() == [Decimal('1.23'), Decimal('2.345'), Decimal('3.456')]
     repacked = tmp_path / 'repacked'
     result2 = run_package(destination / 'mkt.sqlite', repacked, max_file_size=65536)
-    assert result2['copied'] == 5 and result2['reencoded'] == 0
+    assert result2['copied'] == 6 and result2['reencoded'] == 0
     assert payloads(repacked) == frames
     assert mktpack.open(repacked)['kline'].read().equals(original['kline'].read())
     check_package(repacked)
@@ -179,7 +180,7 @@ def test_filters_partial_year_precision_and_ordinary(source, tmp_path):
     root, _ = source
     destination = tmp_path / 'selected'
     result = run_package(root, destination, groups=['kline'], symbols=['BTCUSDT'], start=20250101, end=20260201)
-    assert result['files'] == 2
+    assert result['files'] == 3
     selected = mktpack.open(destination)
     with sqlite3.connect(destination / 'mkt.sqlite') as db, sqlite3.connect(root / 'mkt.sqlite') as original:
         assert db.execute('SELECT * FROM __symbols__ ORDER BY id').fetchall() == original.execute('SELECT * FROM __symbols__ ORDER BY id').fetchall()
@@ -203,7 +204,7 @@ def test_size_boundary_rejection_and_index_warning(source, tmp_path):
     limit = (initial / 'mkt.data.1').stat().st_size
     run_package(root, tmp_path / 'exact-limit', max_file_size=limit, **selection)
     failed = tmp_path / 'too-small'
-    run_package(root, failed, max_file_size=limit-1, **selection, error='年度载荷需要至少')
+    run_package(root, failed, max_file_size=limit-1, **selection, error='需要至少')
     assert list(failed.iterdir()) == []
     existing = tmp_path / 'existing'
     existing.mkdir()
@@ -224,7 +225,7 @@ def test_size_boundary_rejection_and_index_warning(source, tmp_path):
 
 
 @pytest.mark.parametrize('jobs', [1, 4])
-@pytest.mark.parametrize('missing', ['kline/DOGEUSDT/2024.mkp', 'kline/BTCUSDT/2025-02.mkp'])
+@pytest.mark.parametrize('missing', ['kline/DOGEUSDT/2024.mkp', 'kline/BTCUSDT/202502.mkp'])
 def test_failed_pack_cleans_partial_output(source, tmp_path, jobs, missing):
     root, _ = source
     (root / missing).unlink()
@@ -235,12 +236,12 @@ def test_failed_pack_cleans_partial_output(source, tmp_path, jobs, missing):
 
 def test_cross_year_split_and_gaps(source, tmp_path):
     root, db = source
-    add_file(root, db, 'extra', 'X', 'span',
+    add_file(root, db, 'extra', 'X', 2024,
              [milliseconds('2023-12-31'), milliseconds('2025-01-01'), milliseconds('2025-01-01')], ['1', '2', '3'])
     destination = tmp_path / 'split'
     result = run_package(root, destination, groups=['extra'])
-    assert result['files'] == 2
-    assert set(payloads(destination)) == {'extra/X/2023.mkp', 'extra/X/2025.mkp'}
+    assert result['files'] == 1
+    assert set(payloads(destination)) == {'extra/X/2024.mkp'}
     assert mktpack.open(destination)['extra'].read().equals(mktpack.open(root)['extra'].read())
 
 
@@ -248,7 +249,7 @@ def test_cross_year_split_and_gaps(source, tmp_path):
 def test_quantized_pack_preserves_values(source, tmp_path, mixed):
     root, db = source
     for i in range(2):
-        add_file(root, db, 'ratio', 'BTCUSDT', f'2024-0{i+1}', [milliseconds(f'2024-0{i+1}-01')],
+        add_file(root, db, 'ratio', 'BTCUSDT', 202401+i, [milliseconds(f'2024-0{i+1}-01')],
                  lossy=not mixed or i == 1,
                  quantities={'volume': ['1.000'], 'taker_buy_volume': ['.3334000']})
     expected = mktpack.open(root)['ratio'].read()
@@ -274,7 +275,7 @@ def test_check_reports_missing_packed_payload(source, tmp_path, damage):
             db.execute('DELETE FROM blob WHERE id=1')
     else:
         with sqlite3.connect(destination / 'mkt.sqlite') as db:
-            db.execute('UPDATE __timefile__ SET volume=999 WHERE id=1')
+            db.execute('UPDATE __timefile__ SET volume_id=999 WHERE id=1')
     command = subprocess.run([shutil.which('mkt'), '--root', str(destination / 'mkt.sqlite'), 'binance', 'check'], capture_output=True, text=True)
     assert command.returncode == 1
     assert json.loads(command.stdout)['errors']
@@ -287,8 +288,8 @@ def test_cli_package_and_invalid_arguments(source, tmp_path):
     done = subprocess.run([*command, str(destination), '--max-file-size', '32KiB', '--groups', 'kline', '--symbols', 'BTCUSDT',
                            '--start', '2025-01-01', '--end', '2026-01-01'], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
-    assert json.loads(done.stdout)['files'] == 1
-    assert '合并编码' in done.stderr
+    assert json.loads(done.stdout)['files'] == 2
+    assert '复制' in done.stderr
     assert mktpack.open(destination)['kline'].read().num_rows == 3
     for size in ['0', '-1', '1XB']:
         failed = subprocess.run([*command, str(tmp_path / 'invalid'), '--max-file-size', size], capture_output=True, text=True)
@@ -318,9 +319,22 @@ def test_real_dataset_package(tmp_path, real_dataset):
             for symbol in ['BTCUSDT', 'DOGEUSDT', 'ETHUSDT', 'BNBUSDT']:
                 assert packed[name].read(symbol=symbol).equals(original[name].read(symbol=symbol)), (name, symbol)
     frames = payloads(destination)
-    for path in root.rglob('*.mkp'):
-        if len(path.stem) == 4:
-            assert frames[path.relative_to(root).as_posix()] == path.read_bytes()
+    # 只有独占一个 UTC 年且无需裁剪的文件会整段复制；真实 OI 归档可能含次年零点。
+    with sqlite3.connect(root / 'mkt.sqlite') as index:
+        for path in root.rglob('*.mkp'):
+            if len(path.stem) != 4:
+                continue
+            group, symbol, _ = path.relative_to(root).parts
+            start = milliseconds(path.stem + '-01-01')
+            end = milliseconds(f'{int(path.stem)+1}-01-01')
+            inputs = index.execute(
+                'SELECT f.period,f.first_time,f.last_time FROM __timefile__ f '
+                'JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id '
+                'WHERE g.name=? AND s.name=? AND f.first_time<? AND f.last_time>=?',
+                (group, symbol, end, start),
+            ).fetchall()
+            if len(inputs) == 1 and inputs[0][0] == int(path.stem) and start <= inputs[0][1] and inputs[0][2] < end:
+                assert frames[path.relative_to(root).as_posix()] == path.read_bytes()
     check_package(destination)
     selected = tmp_path / 'real-selected'
     run_package(destination, selected, groups=['kline'], symbols=['BTCUSDT', 'DOGEUSDT'], start=20251215, end=20260201, max_file_size=8*1024*1024)

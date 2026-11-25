@@ -40,19 +40,20 @@ inline void bind_value(Statement& statement,int column,const Json& value) {
         sqlite3_bind_text64(s,column,text.data(),text.size(),SQLITE_TRANSIENT,SQLITE_UTF8);
     }
 }
-struct SqlPartition { int64_t start,end,volume,rows,first,last; };
+struct SqlPartition { int64_t start,end,rows,first,last; std::string volume; };
 struct SqlRows { std::vector<std::string> columns; std::vector<std::vector<Json>> rows; };
 
 class SqlReader {
     Database& index;
-    std::map<int64_t,std::unique_ptr<Database>> databases;
+    std::map<std::string,std::unique_ptr<Database>> databases;
 public:
     GroupSpec group;
     SqlReader(Database& db,GroupSpec spec):index(db),group(std::move(spec)) {}
-    Database& database(int64_t volume=0) {
-        if (!volume && group.location.empty()) return index;
-        auto& db=databases[volume];
-        if (!db) db=std::make_unique<Database>(index.root/(volume?"mkt.data."+std::to_string(volume):group.location));
+    Database& database(const std::string& volume={}) {
+        if (volume.empty() && group.location.empty()) return index;
+        const auto path=volume.empty()?group.location:volume;
+        auto& db=databases[path];
+        if (!db) db=std::make_unique<Database>(index.root/std::filesystem::path(path));
         return *db;
     }
     std::vector<SqlPartition> partitions(int64_t start=INT64_MIN,int64_t end=INT64_MAX) {
@@ -60,16 +61,22 @@ public:
         if (!group.location.empty()) {
             Statement q(database(),"SELECT count(*),min("+identifier(group.time)+"),max("+identifier(group.time)+") FROM "+identifier(group.table));
             q.next();
-            if (q.integer(0)) result.push_back({INT64_MIN,INT64_MAX,0,q.integer(0),q.integer(1),q.integer(2)});
+            if (q.integer(0)) result.push_back({INT64_MIN,INT64_MAX,q.integer(0),q.integer(1),q.integer(2),{}});
         } else {
-            Statement q(index,"SELECT start,end,volume,rows,first_time,last_time FROM __sqlite_partitions__ WHERE group_id=? AND start<? AND end>? ORDER BY start");
+            Statement q(index,"SELECT p.start,p.end,p.rows,p.first_time,p.last_time,v.path FROM __sqlite_partitions__ p JOIN __volumes__ v ON v.id=p.volume_id WHERE p.group_id=? AND p.start<? AND p.end>? ORDER BY p.start");
             q.integer(1,group.id); q.integer(2,end); q.integer(3,start);
-            while(q.next()) result.push_back({q.integer(0),q.integer(1),q.integer(2),q.integer(3),q.integer(4),q.integer(5)});
+            while(q.next()) result.push_back({q.integer(0),q.integer(1),q.integer(2),q.integer(3),q.integer(4),q.text(5)});
         }
         return result;
     }
-    SqlRows read_partition(const SqlPartition& part,int64_t start,int64_t end,const std::vector<std::string>& symbols={}) {
-        auto sql="SELECT * FROM "+identifier(group.table)+" WHERE "+identifier(group.time)+">=? AND "+identifier(group.time)+"<?";
+    SqlRows read_partition(const SqlPartition& part,int64_t start,int64_t end,const std::vector<std::string>& symbols={},
+                           const std::vector<std::string>& fields={}) {
+        std::string selection;
+        for(const auto& field:fields) {
+            if(!selection.empty()) selection+=",";
+            selection+=identifier(field);
+        }
+        auto sql="SELECT "+(selection.empty()?"*":selection)+" FROM "+identifier(group.table)+" WHERE "+identifier(group.time)+">=? AND "+identifier(group.time)+"<?";
         std::vector<int64_t> ids;
         if (!symbols.empty()) {
             Statement names(index,"SELECT id,name FROM __symbols__");
@@ -90,17 +97,18 @@ public:
         }
         return result;
     }
-    SqlRows read(int64_t start,int64_t end,const std::vector<std::string>& symbols={}) {
+    SqlRows read(int64_t start,int64_t end,const std::vector<std::string>& symbols={},
+                 const std::vector<std::string>& fields={}) {
         if(!symbols.empty() && group.symbol.empty()) throw std::runtime_error("该时序表没有品种列："+group.name);
         SqlRows result;
         for(const auto& part:partitions(start,end)) {
-            auto batch=read_partition(part,start,end,symbols);
+            auto batch=read_partition(part,start,end,symbols,fields);
             result.columns=std::move(batch.columns);
             for(auto& row:batch.rows) result.rows.push_back(std::move(row));
         }
         return result;
     }
-    std::string create_sql(int64_t volume,const std::string& table) {
+    std::string create_sql(const std::string& volume,const std::string& table) {
         Statement q(database(volume),"SELECT sql FROM sqlite_master WHERE type='table' AND name=?");
         q.text(1,group.table);
         if(!q.next()) throw std::runtime_error("缺少 SQLite 表："+group.table);
@@ -116,43 +124,7 @@ public:
         }
         return "CREATE TABLE "+identifier(table)+sql.substr(offset);
     }
-    ReadTable query(int64_t start,int64_t end,const std::vector<std::string>& symbols) {
-        const auto batch=read(start,end,symbols);
-        std::map<std::string,size_t> positions;
-        for(size_t i=0;i<batch.columns.size();++i) positions[batch.columns[i]]=i;
-        ReadTable result{Json::object(),group.schema,{{"time_column",group.time}}};
-        for(const auto& [name,spec]:group.schema.items())
-            if(spec.value("column",name)==group.time) result.metadata["time_column"]=name;
-        std::map<int64_t,std::string> names;
-        if(!group.symbol.empty()) {
-            Statement q(index,"SELECT id,name FROM __symbols__");
-            while(q.next()) names.emplace(q.integer(0),q.text(1));
-        }
-        for(auto& [name,spec]:result.schema.items()) {
-            auto& values=result.columns[name]=Json::array();
-            if (name=="symbol" && !group.symbol.empty()) {
-                for(const auto& row:batch.rows) values.push_back(names.at(row.at(positions.at(group.symbol)).get<int64_t>()));
-                continue;
-            }
-            if(batch.rows.empty()) continue;
-            const auto column=positions.at(spec.value("column",name));
-            int scale=spec.value("scale",0);
-            const auto scale_column=spec.value("scale_column",std::string{});
-            if(!scale_column.empty()) {
-                int highest=-1;
-                for(const auto& row:batch.rows) if(!row[column].is_null())
-                    highest=std::max(highest,row.at(positions.at(scale_column)).get<int>());
-                if(highest>=0) scale=highest;
-                spec["scale"]=scale;
-            }
-            for(const auto& row:batch.rows) {
-                const auto& value=row[column];
-                if (!value.is_null() && !scale_column.empty()) values.push_back(rescale(value.get<int64_t>(),row.at(positions.at(scale_column)).get<int>(),scale));
-                else values.push_back(value);
-            }
-        }
-        return result;
-    }
+
 };
 
 inline void copy_rows(Database& target,const GroupSpec& group,const std::string& create,const SqlRows& rows) {
