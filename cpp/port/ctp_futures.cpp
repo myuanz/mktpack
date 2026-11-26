@@ -16,6 +16,7 @@
 #include <fstream>
 #include <future>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -29,6 +30,8 @@ namespace {
 namespace fs=std::filesystem;
 using storage::Database;
 using storage::Statement;
+using storage::insert_blob;
+using storage::read_file_bytes;
 using View=std::string_view;
 using Row=std::vector<View>;
 
@@ -202,16 +205,6 @@ void split_row(View line,Row& fields) {
     }
 }
 
-std::vector<uint8_t> file_bytes(const fs::path& path) {
-    std::ifstream input(path,std::ios::binary|std::ios::ate);
-    if(!input)throw std::runtime_error("无法读取："+path.string());
-    std::vector<uint8_t> bytes(size_t(input.tellg()));
-    input.seekg(0);
-    input.read(reinterpret_cast<char*>(bytes.data()),bytes.size());
-    if(!input)throw std::runtime_error("载荷读取失败："+path.string());
-    return bytes;
-}
-
 class CsvInput {
 public:
     struct Stats {uint64_t lines=0,compressed=0,uncompressed=0,parse_ns=0;};
@@ -318,7 +311,7 @@ class Catalog {
                     date_number(std::string(r.at(open))),end});
             expirations[canonical]=std::max(expirations[canonical],end);
         });
-        csv.read(path,file_bytes(path));
+        csv.read(path,read_file_bytes(path));
     }
 public:
     explicit Catalog(const std::vector<fs::path>& roots) {
@@ -463,7 +456,6 @@ std::string tick_volume(const std::string& symbol,int period) {
 }
 
 int64_t volume_id(Database& db,const std::string& path);
-void insert_blob(Statement& insert,int64_t id,const std::vector<uint8_t>& bytes);
 
 template<class Write>
 void with_volume(Database& db,const std::string& path,Write write_rows) {
@@ -619,7 +611,7 @@ class SourceResults {
             std::vector<uint8_t> bytes;
             try {
                 auto timer=profile.scope(Stage::zip_read);
-                bytes=file_bytes(task.source->path);
+                bytes=read_file_bytes(task.source->path);
             } catch(...) {
                 task.result.set_exception(std::current_exception());
                 continue;
@@ -909,15 +901,6 @@ int64_t volume_id(Database& db,const std::string& path) {
     find.text(1,path);find.next();return find.integer(0);
 }
 
-void insert_blob(Statement& insert,int64_t id,const std::vector<uint8_t>& bytes) {
-    sqlite3_reset(insert.statement);
-    sqlite3_clear_bindings(insert.statement);
-    insert.integer(1,id);
-    if(sqlite3_bind_blob64(insert.statement,2,bytes.data(),bytes.size(),SQLITE_TRANSIENT)!=SQLITE_OK)
-        throw std::runtime_error(sqlite3_errmsg(sqlite3_db_handle(insert.statement)));
-    insert.next();
-}
-
 void archive_month(Database& db,Profile& profile,const std::string& path,const std::vector<StoredDay>& days) {
     auto total=profile.scope(Stage::month_total);
     profile.count(Counter::month_days,days.size());
@@ -934,7 +917,7 @@ void archive_month(Database& db,Profile& profile,const std::string& path,const s
                 const auto& source=loose.emplace_back(db.root/"tick"/day.symbol/(std::to_string(day.period)+".mkp"));
                 auto bytes=[&] {
                     auto timer=profile.scope(Stage::month_read);
-                    return file_bytes(source);
+                    return read_file_bytes(source);
                 }();
                 profile.count(Counter::month_read_bytes,bytes.size());
                 {auto timer=profile.scope(Stage::month_insert);insert_blob(insert,day.id,bytes);}
@@ -959,11 +942,8 @@ public:
     std::vector<uint8_t> read(const std::string& path,int64_t id) {
         auto& db=databases[path];
         if(!db)db=std::make_unique<Database>(volume_file(index,path));
-        Statement q(*db,"SELECT bytes FROM blob WHERE id=?");q.integer(1,id);
-        if(!q.next())throw std::runtime_error("卷缺少载荷："+path);
-        const auto size=sqlite3_column_bytes(q.statement,0);
-        const auto* data=static_cast<const uint8_t*>(sqlite3_column_blob(q.statement,0));
-        return {data,data+size};
+        Statement q(*db,"SELECT bytes FROM blob WHERE id=?");
+        return storage::read_blob(q,id,path);
     }
 };
 

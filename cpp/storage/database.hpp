@@ -3,7 +3,7 @@
 #include <sqlite3.h>
 #include <algorithm>
 #include <fstream>
-#include <memory>
+#include <span>
 
 namespace mktpack::storage {
 struct Database {
@@ -90,53 +90,51 @@ inline int64_t group_id(Database& db,const std::string& group) {
 }
 
 
-class PayloadReader {
-    Database& index;
-    std::map<std::string,std::unique_ptr<Database>> volumes;
-    Database& volume(const std::string& path) {
-        auto& result=volumes[path];
-        if(!result) result=std::make_unique<Database>(index.root/std::filesystem::path(path));
-        return *result;
-    }
-public:
-    explicit PayloadReader(Database& database):index(database) {}
-    std::vector<uint8_t> read(int64_t id,const std::string& path,const std::string& volume_path) {
-        if (volume_path.empty()) {
-            std::ifstream input(index.root/path,std::ios::binary|std::ios::ate);
-            if (!input) throw std::runtime_error("无法读取："+(index.root/path).string());
-            std::vector<uint8_t> bytes(input.tellg());
-            input.seekg(0);
-            input.read(reinterpret_cast<char*>(bytes.data()),bytes.size());
-            if (!input) throw std::runtime_error("载荷读取失败："+path);
-            return bytes;
-        }
-        Statement query(volume(volume_path),"SELECT bytes FROM blob WHERE id=?");
-        query.integer(1,id);
-        if (!query.next()) throw std::runtime_error("分卷缺少载荷："+path);
-        const auto* data=static_cast<const uint8_t*>(sqlite3_column_blob(query.statement,0));
-        const auto size=sqlite3_column_bytes(query.statement,0);
-        if (!size) throw std::runtime_error("分卷载荷为空："+path);
-        return {data,data+size};
-    }
-    std::map<int64_t,std::vector<uint8_t>> read_volume(const std::string& path,const std::vector<int64_t>& ids) {
-        std::map<int64_t,std::vector<uint8_t>> result;
-        constexpr size_t batch=500;
-        for(size_t begin=0;begin<ids.size();begin+=batch) {
-            const auto end=std::min(ids.size(),begin+batch);
-            std::string sql="SELECT id,bytes FROM blob WHERE id IN (";
-            for(size_t i=begin;i<end;++i) sql+=(i==begin?"?":",?");
-            Statement query(volume(path),sql+")");
-            for(size_t i=begin;i<end;++i)query.integer(int(i-begin+1),ids[i]);
-            while(query.next()) {
-                const auto* data=static_cast<const uint8_t*>(sqlite3_column_blob(query.statement,1));
-                const auto size=sqlite3_column_bytes(query.statement,1);
-                result.emplace(query.integer(0),std::vector<uint8_t>(data,data+size));
-            }
-        }
-        if(result.size()!=ids.size()) throw std::runtime_error("分卷缺少载荷："+path);
-        return result;
-    }
-};
+inline std::vector<uint8_t> read_file_bytes(const std::filesystem::path& path) {
+    std::ifstream input(path,std::ios::binary|std::ios::ate);
+    if (!input) throw std::runtime_error("无法读取："+path.string());
+    std::vector<uint8_t> bytes(input.tellg());
+    input.seekg(0);
+    input.read(reinterpret_cast<char*>(bytes.data()),bytes.size());
+    if (!input) throw std::runtime_error("载荷读取失败："+path.string());
+    return bytes;
+}
+
+inline std::vector<uint8_t> blob_bytes(const Statement& query,int column) {
+    const auto* data=static_cast<const uint8_t*>(sqlite3_column_blob(query.statement,column));
+    const auto size=sqlite3_column_bytes(query.statement,column);
+    if (!size) return {};
+    return {data,data+size};
+}
+
+inline std::vector<uint8_t> read_blob(Statement& query,int64_t id,const std::string& label) {
+    sqlite3_reset(query.statement);
+    query.integer(1,id);
+    if(!query.next()) throw std::runtime_error("分卷缺少载荷："+label);
+    return blob_bytes(query,0);
+}
+
+inline constexpr size_t volume_batch_size=500;
+
+inline std::map<int64_t,std::vector<uint8_t>> read_volume(Database& database,std::span<const int64_t> ids) {
+    std::map<int64_t,std::vector<uint8_t>> result;
+    std::string sql="SELECT id,bytes FROM blob WHERE id IN (";
+    for(size_t i=0;i<ids.size();++i)sql+=(i?",?":"?");
+    Statement query(database,sql+")");
+    for(size_t i=0;i<ids.size();++i)query.integer(int(i+1),ids[i]);
+    while(query.next())result.emplace(query.integer(0),blob_bytes(query,1));
+    if(result.size()!=ids.size()) throw std::runtime_error("分卷缺少载荷："+database.path.string());
+    return result;
+}
+
+inline void insert_blob(Statement& insert,int64_t id,std::span<const uint8_t> bytes) {
+    insert.integer(1,id);
+    if(sqlite3_bind_blob64(insert.statement,2,bytes.data(),bytes.size(),SQLITE_TRANSIENT)!=SQLITE_OK)
+        throw std::runtime_error(sqlite3_errmsg(sqlite3_db_handle(insert.statement)));
+    insert.next();
+    sqlite3_reset(insert.statement);
+    sqlite3_clear_bindings(insert.statement);
+}
 
 inline void slice(Table& table, int64_t start, int64_t end) {
     const auto& time=table.columns.at("time");

@@ -1,10 +1,15 @@
 #include <mktpack/storage.hpp>
 #include "sqlite.hpp"
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <deque>
 #include <future>
+#include <memory>
+#include <mutex>
 #include <set>
+#include <span>
+#include <thread>
 
 namespace mktpack {
 namespace {
@@ -13,8 +18,114 @@ namespace fs=std::filesystem;
 using namespace std::chrono;
 
 struct File {
-    int64_t id,period,first,last;
-    std::string group,symbol,path,volume;
+    int64_t id,group,symbol,period,first,last,rows;
+    std::optional<int64_t> volume;
+};
+
+struct PackageFiles {
+    std::vector<File> entries;
+    std::map<int64_t,std::string> groups,symbols,volumes;
+
+    std::string path(const File& file) const {
+        return groups.at(file.group)+"/"+symbols.at(file.symbol)+"/"+std::to_string(file.period)+".mkp";
+    }
+};
+
+class PackagePayloads {
+    struct Batch {
+        std::vector<std::vector<uint8_t>> payloads;
+        size_t bytes=sizeof(payloads);
+    };
+    static constexpr size_t read_budget=64*1024*1024;
+    static constexpr uintmax_t prefetch_limit=32*1024*1024;
+
+    fs::path root;
+    const PackageFiles& plan;
+    bool prefetch_volumes;
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::condition_variable_any space;
+    std::deque<Batch> pending;
+    size_t pending_bytes=0;
+    std::exception_ptr error;
+    Batch current;
+    size_t next=0;
+    std::jthread reader;
+
+    void read(std::stop_token stop) {
+        try {
+            std::optional<Database> volume;
+            std::optional<int64_t> open_volume;
+            std::vector<char> buffer;
+            std::vector<int64_t> ids;
+            ids.reserve(volume_batch_size);
+            const auto& files=plan.entries;
+            for(size_t i=0;i<files.size() && !stop.stop_requested();) {
+                Batch batch;
+                const auto& entry=files[i];
+                if(!entry.volume) {
+                    batch.payloads.push_back(read_file_bytes(root/plan.path(entry)));
+                    ++i;
+                } else {
+                    if(open_volume!=entry.volume) {
+                        volume.emplace(root/fs::path(plan.volumes.at(*entry.volume)));
+                        open_volume=entry.volume;
+                        if(prefetch_volumes) {
+                            std::error_code stat_error;
+                            if(fs::file_size(volume->path,stat_error)<=prefetch_limit) {
+                                if(buffer.empty())buffer.resize(1024*1024);
+                                std::ifstream stream(volume->path,std::ios::binary);
+                                while(stream.read(buffer.data(),buffer.size())) {}
+                                volume->exec("PRAGMA mmap_size="+std::to_string(prefetch_limit));
+                            }
+                        }
+                    }
+                    ids.clear();
+                    for(;i<files.size() && ids.size()<volume_batch_size && files[i].volume==open_volume;++i)
+                        ids.push_back(files[i].id);
+                    auto payloads=read_volume(*volume,ids);
+                    batch.payloads.reserve(ids.size());
+                    for(auto id:ids)batch.payloads.push_back(std::move(payloads.at(id)));
+                }
+                for(const auto& bytes:batch.payloads)batch.bytes+=bytes.size()+sizeof(bytes);
+                std::unique_lock lock(mutex);
+                space.wait(lock,stop,[&] {
+                    return pending.empty() ||
+                        (pending_bytes<=read_budget && batch.bytes<=read_budget-pending_bytes);
+                });
+                if(stop.stop_requested())return;
+                pending_bytes+=batch.bytes;
+                pending.push_back(std::move(batch));
+                lock.unlock();
+                ready.notify_one();
+            }
+        } catch(...) {
+            {
+                std::lock_guard lock(mutex);
+                error=std::current_exception();
+            }
+            ready.notify_one();
+        }
+    }
+public:
+    PackagePayloads(const fs::path& source,const PackageFiles& files,bool prefetch)
+        :root(source),plan(files),prefetch_volumes(prefetch) {
+        if(!plan.entries.empty())reader=std::jthread([this](std::stop_token stop){read(stop);});
+    }
+    std::vector<uint8_t> take() {
+        if(next==current.payloads.size()) {
+            std::unique_lock lock(mutex);
+            ready.wait(lock,[&]{return !pending.empty() || error;});
+            if(pending.empty())std::rethrow_exception(error);
+            current=std::move(pending.front());
+            pending.pop_front();
+            pending_bytes-=current.bytes;
+            next=0;
+            lock.unlock();
+            space.notify_one();
+        }
+        return std::move(current.payloads[next++]);
+    }
 };
 
 uint64_t database_size(Database& db) {
@@ -27,6 +138,7 @@ class Volumes {
     fs::path root;
     uint64_t limit;
     std::unique_ptr<Database> current;
+    std::optional<Statement> blob_insert;
     size_t entries=0;
 public:
     size_t count=0;
@@ -35,6 +147,7 @@ public:
     std::string path(int64_t id) const { return "mkt.data."+std::to_string(id); }
     void close() {
         if (!current) return;
+        blob_insert.reset();
         current->exec("COMMIT");
         bytes+=database_size(*current);
         current.reset();
@@ -44,7 +157,7 @@ public:
             if (!current) {
                 ++count;
                 current=std::make_unique<Database>(root/path(count),SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
-                current->exec("PRAGMA journal_mode=DELETE;BEGIN");
+                current->exec("PRAGMA journal_mode=MEMORY;BEGIN");
                 entries=0;
             }
             current->exec("SAVEPOINT entry");
@@ -64,30 +177,162 @@ public:
     }
     int64_t append(int64_t id,const std::vector<uint8_t>& payload,const std::string& label) {
         return append_entry(label,[&](Database& db) {
-            db.exec("CREATE TABLE IF NOT EXISTS blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
-            Statement insert(db,"INSERT INTO blob(id,bytes) VALUES(?,?)");
-            insert.integer(1,id);
-            if (sqlite3_bind_blob64(insert.statement,2,payload.data(),payload.size(),SQLITE_TRANSIENT)!=SQLITE_OK)
-                throw std::runtime_error(sqlite3_errmsg(db.db));
-            insert.next();
+            if(!blob_insert) {
+                db.exec("CREATE TABLE blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
+                blob_insert.emplace(db,"INSERT INTO blob(id,bytes) VALUES(?,?)");
+            }
+            insert_blob(*blob_insert,id,payload);
         });
     }
 };
 
 void copy_index(Database& source,Database& destination) {
+    destination.exec("PRAGMA journal_mode=MEMORY");
     auto* backup=sqlite3_backup_init(destination.db,"main",source.db,"main");
     if (!backup) throw std::runtime_error(sqlite3_errmsg(destination.db));
     const auto status=sqlite3_backup_step(backup,-1);
     const auto finish=sqlite3_backup_finish(backup);
     if (status!=SQLITE_DONE || finish!=SQLITE_OK)
         throw std::runtime_error("索引复制失败："+std::string(sqlite3_errmsg(destination.db)));
-    destination.exec("PRAGMA journal_mode=DELETE");
+    destination.exec("PRAGMA journal_mode=MEMORY");
 }
 
-int64_t register_volume(Database& db,const Volumes& volumes,int64_t id) {
+void register_volume(Database& db,const Volumes& volumes,int64_t id) {
     Statement insert(db,"INSERT OR IGNORE INTO __volumes__(id,path) VALUES(?,?)");
     insert.integer(1,id);insert.text(2,volumes.path(id));insert.next();
-    return id;
+}
+
+struct MkpStats {
+    size_t copied=0,reencoded=0;
+    int64_t rows=0;
+    size_t files() const {return copied+reencoded;}
+};
+
+void report_mkp(const PackageOptions& options,const std::string& path,const Volumes& volumes,int64_t volume,
+                bool copy,size_t done,size_t total) {
+    if(options.progress) options.progress(path+" "+(copy?"复制":"裁剪编码")+
+        " → "+volumes.path(volume)+" ("+std::to_string(done)+"/"+std::to_string(total)+")");
+}
+
+void relocate_volume(Database& output,int64_t volume,std::span<const int64_t> ids) {
+    constexpr size_t batch=500;
+    while(!ids.empty()) {
+        const auto chunk=ids.first(std::min(batch,ids.size()));
+        std::string sql="UPDATE __timefile__ SET volume_id=? WHERE id IN (?";
+        for(size_t i=1;i<chunk.size();++i)sql+=",?";
+        Statement update(output,sql+")");
+        update.integer(1,volume);
+        for(size_t i=0;i<chunk.size();++i)update.integer(int(i+2),chunk[i]);
+        update.next();
+        ids=ids.subspan(chunk.size());
+    }
+}
+
+MkpStats relocate_mkp(Database& output,Volumes& volumes,PackagePayloads& payloads,
+                      const PackageFiles& plan,const PackageOptions& options) {
+    MkpStats stats;
+    int64_t active_volume=0;
+    std::vector<int64_t> ids;
+    for(const auto& file:plan.entries) {
+        auto bytes=payloads.take();
+        if(bytes.empty()) {
+            Statement remove(output,"DELETE FROM __timefile__ WHERE id=?");
+            remove.integer(1,file.id);remove.next();
+            continue;
+        }
+        const auto path=plan.path(file);
+        const auto volume=volumes.append(file.id,bytes,path);
+        if(volume!=active_volume) {
+            relocate_volume(output,active_volume,ids);
+            ids.clear();
+            register_volume(output,volumes,volume);
+            active_volume=volume;
+        }
+        ids.push_back(file.id);
+        stats.rows+=file.rows;
+        ++stats.copied;
+        report_mkp(options,path,volumes,volume,true,stats.files(),plan.entries.size());
+    }
+    relocate_volume(output,active_volume,ids);
+    return stats;
+}
+
+MkpStats pack_selected_mkp(Database& input,Database& output,Volumes& volumes,PackagePayloads& payloads,
+                           const PackageFiles& plan,const PackageOptions& options) {
+    MkpStats stats;
+    const auto& files=plan.entries;
+    struct GroupSchema {Json original,output;};
+    std::map<int64_t,GroupSchema> schemas;
+    Statement insert(output,"INSERT INTO __timefile__(id,group_id,symbol_id,period,first_time,last_time,rows,volume_id) VALUES(?,?,?,?,?,?,?,?)");
+    int64_t active_volume=0;
+    struct Pending {
+        size_t index;
+        bool copy;
+        std::vector<uint8_t> bytes;
+        std::future<std::vector<uint8_t>> work;
+    };
+    std::deque<Pending> pending;
+    size_t next_file=0;
+    while(next_file<files.size() || !pending.empty()) {
+        while(next_file<files.size() && pending.size()<options.jobs) {
+            const auto index=next_file++;
+            const auto& file=files[index];
+            auto bytes=payloads.take();
+            const bool copy=file.first>=options.start && file.last<options.end;
+            if(copy) pending.push_back({index,true,std::move(bytes),{}});
+            else {
+                auto task=[bytes=std::move(bytes),start=options.start,end=options.end]() mutable {
+                    auto table=decode(bytes);
+                    slice(table,start,end);
+                    if(table.columns.at("time").empty()) return std::vector<uint8_t>{};
+                    return encode(table);
+                };
+                pending.push_back({index,false,{},std::async(options.jobs==1?std::launch::deferred:std::launch::async,std::move(task))});
+            }
+        }
+        auto item=std::move(pending.front());
+        pending.pop_front();
+        const auto& file=files[item.index];
+        auto bytes=item.copy?std::move(item.bytes):item.work.get();
+        if(bytes.empty()) continue;
+        const auto header=info(bytes);
+        const auto path=plan.path(file);
+        const auto volume=volumes.append(file.id,bytes,path);
+        if(volume!=active_volume) {
+            register_volume(output,volumes,volume);
+            active_volume=volume;
+        }
+        insert.integer(1,file.id);insert.integer(2,file.group);insert.integer(3,file.symbol);
+        insert.integer(4,file.period);insert.integer(5,header.at("first_time"));insert.integer(6,header.at("last_time"));
+        insert.integer(7,header.at("rows"));insert.integer(8,volume);insert.next();
+        sqlite3_reset(insert.statement);
+        auto [schema_position,new_group]=schemas.try_emplace(file.group);
+        auto& [original,group_schema]=schema_position->second;
+        if(new_group) {
+            Statement query(input,"SELECT schema FROM __group__ WHERE id=?");
+            query.integer(1,file.group);query.next();
+            original=Json::parse(query.text(0));
+        }
+        for(const auto& descriptor:header.at("columns")) {
+            const auto name=descriptor.at("name").get<std::string>();
+            auto& schema=group_schema[name];
+            if(schema.is_null()) {
+                schema=original.value(name,Json::object());
+                schema["scale"]=descriptor.value("scale",0);
+            } else schema["scale"]=std::max(schema.value("scale",0),descriptor.value("scale",0));
+            schema["type"]=descriptor.at("type");
+        }
+        stats.rows+=header.at("rows").get<int64_t>();
+        if(item.copy)++stats.copied;
+        else ++stats.reencoded;
+        report_mkp(options,path,volumes,volume,item.copy,stats.files(),files.size());
+    }
+    for(const auto& [group,schema]:schemas) {
+        Statement update(output,"UPDATE __group__ SET schema=? WHERE id=?");
+        update.text(1,schema.output.dump());update.integer(2,group);update.next();
+    }
+
+    return stats;
 }
 }
 
@@ -100,7 +345,6 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
 
     Database input(source);
     input.exec("BEGIN");
-    PayloadReader payloads(input);
     std::set<std::string> selected,excluded;
     {
         std::set<std::string> known;
@@ -115,31 +359,56 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
         for(const auto& name:options.groups) if(!known.contains(name)) throw std::runtime_error("未知数据组："+name);
     }
 
-    std::vector<File> files;
+    const bool full_range=options.start==INT64_MIN && options.end==INT64_MAX &&
+        options.symbols.empty() && options.groups.empty();
+    PackageFiles plan;
     {
-        Statement q(input,"SELECT f.id,f.period,f.first_time,f.last_time,g.name,s.name,"
-                          "g.name||'/'||s.name||'/'||f.period||'.mkp',coalesce(v.path,'') "
+        Statement q(input,"SELECT f.id,f.group_id,f.symbol_id,f.period,f.first_time,f.last_time,f.rows,g.name,s.name,v.id,v.path "
                           "FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id "
                           "JOIN __symbols__ s ON s.id=f.symbol_id LEFT JOIN __volumes__ v ON v.id=f.volume_id "
                           "WHERE f.first_time<? AND f.last_time>=? ORDER BY g.name,s.name,f.period,f.id");
         q.integer(1,options.end);q.integer(2,options.start);
         while(q.next()) {
-            const auto group=q.text(4),symbol=q.text(5);
-            if(!selected.contains(group)) continue;
-            if(!options.symbols.empty() && std::find(options.symbols.begin(),options.symbols.end(),symbol)==options.symbols.end()) continue;
-            files.push_back({q.integer(0),q.integer(1),q.integer(2),q.integer(3),group,symbol,q.text(6),q.text(7)});
+            const auto group=q.integer(1),symbol=q.integer(2);
+            if(!plan.groups.contains(group)) {
+                auto name=q.text(7);
+                if(!selected.contains(name)) continue;
+                plan.groups.emplace(group,std::move(name));
+            }
+            if(!plan.symbols.contains(symbol)) {
+                auto name=q.text(8);
+                if(!options.symbols.empty() && std::find(options.symbols.begin(),options.symbols.end(),name)==options.symbols.end()) continue;
+                plan.symbols.emplace(symbol,std::move(name));
+            }
+            std::optional<int64_t> volume;
+            if(sqlite3_column_type(q.statement,9)!=SQLITE_NULL) {
+                const auto id=q.integer(9);
+                auto [path,new_path]=plan.volumes.try_emplace(id);
+                if(new_path)path->second=q.text(10);
+                if(!path->second.empty())volume=id;
+            }
+            plan.entries.push_back({q.integer(0),group,symbol,q.integer(3),q.integer(4),q.integer(5),q.integer(6),volume});
         }
     }
-    if(options.progress) options.progress("发现 "+std::to_string(files.size())+" 个逻辑载荷");
+    bool relocate=false;
+    if(full_range) {
+        Statement count(input,"SELECT count(*) FROM __timefile__");
+        count.next();
+        relocate=count.integer(0)==int64_t(plan.entries.size());
+    }
+    if(options.progress) options.progress("发现 "+std::to_string(plan.entries.size())+" 个逻辑载荷");
 
     fs::create_directories(destination);
     const auto work=destination/".mkt-package";
     fs::create_directory(work);
     Json result={{"files",0},{"rows",0},{"copied",0},{"reencoded",0},{"warnings",Json::array()}};
     try {
-        Database output(work/"mkt.sqlite",SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
+        PackagePayloads payloads(input.root,plan,full_range);
+        std::optional<Database> output_db(std::in_place,work/"mkt.sqlite",SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
+        auto& output=*output_db;
         copy_index(input,output);
-        output.exec("DELETE FROM __timefile__;DELETE FROM __volumes__;DELETE FROM __sqlite_partitions__;PRAGMA application_id=0x4d4b5450");
+        if(!relocate)output.exec("DELETE FROM __timefile__");
+        output.exec("DELETE FROM __volumes__;DELETE FROM __sqlite_partitions__;PRAGMA application_id=0x4d4b5450");
         for(const auto& group:excluded) {
             Statement remove(output,"DELETE FROM __group__ WHERE name=?");remove.text(1,group);remove.next();
         }
@@ -154,90 +423,10 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
         }
 
         Volumes volumes(work,options.max_file_size);
-        std::map<std::pair<std::string,std::string>,Json> schemas;
-        int64_t rows=0,sqlite_rows=0;
-        size_t processed=0,file_count=0;
+        int64_t sqlite_rows=0;
         output.exec("BEGIN");
-        std::string cached_volume;
-        std::map<int64_t,std::vector<uint8_t>> cached_payloads;
-        auto load_payload=[&](size_t file_index) {
-            const auto& file=files[file_index];
-            std::vector<uint8_t> bytes;
-            if(file.volume.empty()) bytes=payloads.read(file.id,file.path,{});
-            else {
-                if(file.volume!=cached_volume || !cached_payloads.contains(file.id)) {
-                    cached_volume=file.volume;
-                    std::vector<int64_t> ids;
-                    for(size_t i=file_index;i<files.size() && ids.size()<500;++i) {
-                        if(files[i].volume==cached_volume)ids.push_back(files[i].id);
-                    }
-                    cached_payloads=payloads.read_volume(cached_volume,ids);
-                }
-                bytes=std::move(cached_payloads.at(file.id));
-                cached_payloads.erase(file.id);
-            }
-            return bytes;
-        };
-        struct Pending {
-            size_t index;
-            bool copy;
-            std::vector<uint8_t> bytes;
-            std::future<std::vector<uint8_t>> work;
-        };
-        std::deque<Pending> pending;
-        size_t next_file=0;
-        while(next_file<files.size() || !pending.empty()) {
-            while(next_file<files.size() && pending.size()<options.jobs) {
-                const auto index=next_file++;
-                const auto& file=files[index];
-                auto bytes=load_payload(index);
-                const bool copy=file.first>=options.start && file.last<options.end;
-                if(copy) pending.push_back({index,true,std::move(bytes),{}});
-                else {
-                    auto task=[bytes=std::move(bytes),start=options.start,end=options.end]() mutable {
-                        auto table=decode(bytes);
-                        slice(table,start,end);
-                        if(table.columns.at("time").empty()) return std::vector<uint8_t>{};
-                        return encode(table);
-                    };
-                    pending.push_back({index,false,{},std::async(options.jobs==1?std::launch::deferred:std::launch::async,std::move(task))});
-                }
-            }
-            auto item=std::move(pending.front());
-            pending.pop_front();
-            const auto& file=files[item.index];
-            auto bytes=item.copy?std::move(item.bytes):item.work.get();
-            if(bytes.empty()) continue;
-            const auto header=info(bytes);
-            const auto volume=volumes.append(file.id,bytes,file.group+"/"+file.symbol+"/"+std::to_string(file.period)+".mkp");
-            register_volume(output,volumes,volume);
-            Statement insert(output,"INSERT INTO __timefile__(id,group_id,symbol_id,period,first_time,last_time,rows,volume_id) VALUES(?,?,?,?,?,?,?,?)");
-            insert.integer(1,file.id);insert.integer(2,group_id(output,file.group));insert.integer(3,symbol_id(output,file.symbol));
-            insert.integer(4,file.period);insert.integer(5,header.at("first_time"));insert.integer(6,header.at("last_time"));
-            insert.integer(7,header.at("rows"));insert.integer(8,volume);insert.next();
-            ++file_count;
-            for(const auto& descriptor:header.at("columns")) {
-                const auto name=descriptor.at("name").get<std::string>();
-                auto& schema=schemas[{file.group,name}];
-                if(schema.is_null()) {
-                    Statement original(input,"SELECT schema FROM __group__ WHERE name=?");original.text(1,file.group);
-                    schema=original.next()?Json::parse(original.text(0)).value(name,Json::object()):Json::object();
-                    schema["scale"]=descriptor.value("scale",0);
-                } else schema["scale"]=std::max(schema.value("scale",0),descriptor.value("scale",0));
-                schema["type"]=descriptor.at("type");
-            }
-            rows+=header.at("rows").get<int64_t>();
-            const auto kind=item.copy?"copied":"reencoded";
-            result[kind]=result[kind].get<size_t>()+1;
-            if(options.progress) options.progress(file.group+"/"+file.symbol+"/"+std::to_string(file.period)+".mkp "+
-                (item.copy?"复制":"裁剪编码")+" → "+volumes.path(volume)+" ("+std::to_string(++processed)+"/"+std::to_string(files.size())+")");
-        }
-        std::map<std::string,Json> group_schemas;
-        for(const auto& [key,schema]:schemas)group_schemas[key.first][key.second]=schema;
-        for(const auto& [group,schema]:group_schemas) {
-            Statement update(output,"UPDATE __group__ SET schema=? WHERE name=?");
-            update.text(1,schema.dump());update.text(2,group);update.next();
-        }
+        const auto mkp=relocate?relocate_mkp(output,volumes,payloads,plan,options)
+                               :pack_selected_mkp(input,output,volumes,payloads,plan,options);
 
         for(const auto& name:selected) {
             const auto spec=group_spec(input,name);
@@ -271,13 +460,14 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
                 sqlite_rows+=records.rows.size();
             }
         }
-        rows+=sqlite_rows;
         output.exec("COMMIT;VACUUM");
         volumes.close();
         const auto index_size=database_size(output);
         if(index_size>options.max_file_size)result["warnings"].push_back("mkt.sqlite 为 "+std::to_string(index_size)+" 字节，超过分卷上限 "+std::to_string(options.max_file_size));
-        result["files"]=file_count;result["rows"]=rows;result["sqlite_rows"]=sqlite_rows;
+        result["files"]=mkp.files();result["rows"]=mkp.rows+sqlite_rows;result["sqlite_rows"]=sqlite_rows;
+        result["copied"]=mkp.copied;result["reencoded"]=mkp.reencoded;
         result["volumes"]=volumes.count;result["index_bytes"]=index_size;result["bytes"]=index_size+volumes.bytes+ordinary_bytes;
+        output_db.reset();
         for(const auto& entry:fs::directory_iterator(work))fs::rename(entry.path(),destination/entry.path().filename());
         fs::remove(work);
     } catch(...) {

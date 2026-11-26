@@ -99,9 +99,9 @@ QueryResult query(const std::filesystem::path& root, const std::string& group,
     fields.erase("symbol");
     fields.insert("time");
     const std::vector<std::string> physical(fields.begin(),fields.end());
-    struct Entry {std::string symbol,path,volume;int64_t id;};
+    struct Entry {std::string symbol,path;int64_t id;};
     std::vector<Entry> entries;
-    PayloadReader reader(database);
+    std::map<std::string,std::vector<size_t>> grouped;
     std::string sql="SELECT s.name,g.name||'/'||s.name||'/'||f.period||'.mkp',f.id,coalesce(v.path,'') "
                     "FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id "
                     "LEFT JOIN __volumes__ v ON v.id=f.volume_id WHERE g.name=? AND first_time<? AND last_time>=?";
@@ -114,22 +114,33 @@ QueryResult query(const std::filesystem::path& root, const std::string& group,
     files.text(1,group); files.integer(2,end); files.integer(3,start);
     for(size_t i=0;i<symbols.size();++i)files.text(int(i+4),symbols[i]);
     while (start<end && files.next()) {
-        entries.push_back({files.text(0),files.text(1),files.text(3),files.integer(2)});
+        auto volume=files.text(3);
+        const bool loose=volume.empty();
+        if(!loose)grouped[std::move(volume)].push_back(entries.size());
+        entries.push_back({files.text(0),loose?files.text(1):std::string{},files.integer(2)});
     }
-    std::map<std::string,std::vector<int64_t>> grouped;
-    for(const auto& entry:entries)if(!entry.volume.empty())grouped[entry.volume].push_back(entry.id);
-    std::map<std::string,std::map<int64_t,std::vector<uint8_t>>> loaded;
-    for(const auto& [volume,ids]:grouped)loaded.emplace(volume,reader.read_volume(volume,ids));
     std::vector<std::vector<uint8_t>> payloads(entries.size());
+    std::vector<int64_t> ids;
+    ids.reserve(volume_batch_size);
+    for(const auto& [path,positions]:grouped) {
+        Database volume(database.root/std::filesystem::path(path));
+        for(size_t begin=0;begin<positions.size();begin+=volume_batch_size) {
+            const auto end=std::min(positions.size(),begin+volume_batch_size);
+            ids.clear();
+            for(size_t i=begin;i<end;++i)ids.push_back(entries[positions[i]].id);
+            auto batch=read_volume(volume,ids);
+            for(size_t i=begin;i<end;++i)payloads[positions[i]]=std::move(batch.at(entries[positions[i]].id));
+        }
+    }
     for(size_t i=0;i<entries.size();++i) {
-        const auto& entry=entries[i];
-        payloads[i]=entry.volume.empty()?reader.read(entry.id,entry.path,{}):std::move(loaded.at(entry.volume).at(entry.id));
+        if(!entries[i].path.empty())payloads[i]=read_file_bytes(database.root/entries[i].path);
     }
     std::vector<Table> decoded(entries.size());
     std::atomic_size_t next{0};
     auto decode_next=[&] {
         for(size_t i=next++;i<entries.size();i=next++) {
-            auto table=decode(payloads[i],physical);
+            const auto bytes=std::move(payloads[i]);
+            auto table=decode(bytes,physical);
             const auto& time=table.columns.at("time");
             if(!time.empty() && (time.front()<start || time.back()>=end))slice(table,start,end);
             if(!table.columns.at("time").empty())table.metadata["symbol"]=entries[i].symbol;
@@ -151,7 +162,6 @@ QueryResult query(const std::filesystem::path& root, const std::string& group,
 
 Json check_dataset(const std::filesystem::path& root) {
     Database database(root);
-    PayloadReader reader(database);
     Json errors=Json::array();
     {
         Statement missing(database,"SELECT 'timefile',id FROM __timefile__ f WHERE volume_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM __volumes__ v WHERE v.id=f.volume_id) "
@@ -160,12 +170,26 @@ Json check_dataset(const std::filesystem::path& root) {
     }
     Statement files(database,"SELECT f.id,g.name||'/'||s.name||'/'||f.period||'.mkp',first_time,last_time,rows,coalesce(v.path,'') "
                              "FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id "
-                             "LEFT JOIN __volumes__ v ON v.id=f.volume_id ORDER BY f.id");
+                             "LEFT JOIN __volumes__ v ON v.id=f.volume_id ORDER BY v.path,f.id");
+    std::optional<Database> volume;
+    std::optional<Statement> blob;
     size_t count=0;
     while (files.next()) {
         const auto path=files.text(1);
         try {
-            const auto bytes=reader.read(files.integer(0),path,files.text(5));
+            const auto volume_path=files.text(5);
+            std::vector<uint8_t> bytes;
+            if(volume_path.empty())bytes=read_file_bytes(database.root/path);
+            else {
+                const auto location=database.root/std::filesystem::path(volume_path);
+                if(!volume || volume->path!=location) {
+                    blob.reset();
+                    volume.emplace(location);
+                }
+                if(!blob)blob.emplace(*volume,"SELECT bytes FROM blob WHERE id=?");
+                bytes=read_blob(*blob,files.integer(0),path);
+                if(bytes.empty())throw std::runtime_error("分卷载荷为空："+path);
+            }
             const auto table=decode(bytes);
             const auto& time=table.columns.at("time");
             const bool valid=!time.empty() && time.size()==size_t(files.integer(4)) && time.front()==files.integer(2) &&
@@ -176,6 +200,8 @@ Json check_dataset(const std::filesystem::path& root) {
         }
         ++count;
     }
+    blob.reset();
+    volume.reset();
     int64_t sql_rows=0;
     Statement groups(database,"SELECT name FROM __group__ WHERE storage='sqlite'");
     while(groups.next()) {

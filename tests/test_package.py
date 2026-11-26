@@ -196,6 +196,58 @@ def test_filters_partial_year_precision_and_ordinary(source, tmp_path):
     assert mktpack.open(narrow)['kline'].read(start='2026-01-01').num_rows == 0
 
 
+def test_package_reads_interleaved_volumes_with_wal(source, tmp_path):
+    root, _ = source
+    packed = tmp_path / 'packed'
+    assert run_package(root, packed, max_file_size='1MiB')['volumes'] == 1
+    expected = payloads(packed)
+    wal_volume = packed / 'wal.data'
+    with sqlite3.connect(packed / 'mkt.sqlite') as index:
+        middle, = index.execute(
+            'SELECT f.id FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id '
+            'JOIN __symbols__ s ON s.id=f.symbol_id ORDER BY g.name,s.name,f.period LIMIT 1 OFFSET 2'
+        ).fetchone()
+        index.execute('INSERT INTO __volumes__ VALUES(0,?)', (str(wal_volume),))
+        index.execute('UPDATE __timefile__ SET volume_id=0 WHERE id=?', (middle,))
+    with sqlite3.connect(packed / 'mkt.data.1') as first:
+        blob, = first.execute('SELECT bytes FROM blob WHERE id=?', (middle,)).fetchone()
+    with sqlite3.connect(wal_volume) as second:
+        second.execute('CREATE TABLE blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)')
+        assert second.execute('PRAGMA journal_mode=WAL').fetchone() == ('wal',)
+        second.execute('PRAGMA wal_autocheckpoint=0')
+        second.execute('INSERT INTO blob VALUES(?,?)', (middle, blob))
+        second.commit()
+        assert mktpack.open(packed)['kline'].read().equals(mktpack.open(root)['kline'].read())
+        check_package(packed)
+        repacked = tmp_path / 'repacked-wal'
+        run_package(packed, repacked)
+        assert payloads(repacked) == expected
+
+
+def test_full_package_preserves_index_metadata(source, tmp_path):
+    root, db = source
+    schema = json.loads(db.execute("SELECT schema FROM __group__ WHERE name='kline'").fetchone()[0])
+    original_scale = schema['value']['scale']
+    schema['value']['scale'] = 7
+    db.execute("UPDATE __group__ SET schema=? WHERE name='kline'", (json.dumps(schema),))
+    db.commit()
+    columns = 'id,group_id,symbol_id,period,first_time,last_time,rows'
+    expected = db.execute(f'SELECT {columns} FROM __timefile__ ORDER BY id').fetchall()
+    destination = tmp_path / 'full'
+    result = run_package(root, destination, max_file_size=32768)
+    assert result['rows'] == sum(row[-1] for row in expected)
+    with sqlite3.connect(destination / 'mkt.sqlite') as packed:
+        assert packed.execute(f'SELECT {columns} FROM __timefile__ ORDER BY id').fetchall() == expected
+        assert json.loads(packed.execute("SELECT schema FROM __group__ WHERE name='kline'").fetchone()[0]) == schema
+    filtered = tmp_path / 'filtered'
+    run_package(root, filtered, groups=['kline'])
+    with sqlite3.connect(filtered / 'mkt.sqlite') as packed:
+        assert packed.execute(f'SELECT {columns} FROM __timefile__ ORDER BY id').fetchall() == [
+            row for row in expected if row[1] == 2
+        ]
+    assert mktpack.open(filtered)['kline'].describe()['schema']['value']['scale'] == original_scale
+
+
 def test_size_boundary_rejection_and_index_warning(source, tmp_path):
     root, _ = source
     selection = dict(groups=['kline'], symbols=['BTCUSDT'], start=20240101, end=20250101)
@@ -308,7 +360,7 @@ def test_real_dataset_package(tmp_path, real_dataset):
     destination = tmp_path / 'real-package'
     result = run_package(root, destination, max_file_size=8*1024*1024)
     assert result['volumes'] > 1
-    assert result['copied'] > 0 and result['reencoded'] > 0
+    assert result['copied'] == result['files'] > 0 and result['reencoded'] == 0
     assert all(p.stat().st_size <= 8*1024*1024 for p in destination.glob('mkt.data.*'))
     packed = mktpack.open(destination / 'mkt.sqlite')
     for group in original.describe():
@@ -318,23 +370,10 @@ def test_real_dataset_package(tmp_path, real_dataset):
         else:
             for symbol in ['BTCUSDT', 'DOGEUSDT', 'ETHUSDT', 'BNBUSDT']:
                 assert packed[name].read(symbol=symbol).equals(original[name].read(symbol=symbol)), (name, symbol)
-    frames = payloads(destination)
-    # 只有独占一个 UTC 年且无需裁剪的文件会整段复制；真实 OI 归档可能含次年零点。
-    with sqlite3.connect(root / 'mkt.sqlite') as index:
-        for path in root.rglob('*.mkp'):
-            if len(path.stem) != 4:
-                continue
-            group, symbol, _ = path.relative_to(root).parts
-            start = milliseconds(path.stem + '-01-01')
-            end = milliseconds(f'{int(path.stem)+1}-01-01')
-            inputs = index.execute(
-                'SELECT f.period,f.first_time,f.last_time FROM __timefile__ f '
-                'JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id '
-                'WHERE g.name=? AND s.name=? AND f.first_time<? AND f.last_time>=?',
-                (group, symbol, end, start),
-            ).fetchall()
-            if len(inputs) == 1 and inputs[0][0] == int(path.stem) and start <= inputs[0][1] and inputs[0][2] < end:
-                assert frames[path.relative_to(root).as_posix()] == path.read_bytes()
+    for relative, data in payloads(destination).items():
+        path = root / relative
+        if path.is_file():
+            assert data == path.read_bytes()
     check_package(destination)
     selected = tmp_path / 'real-selected'
     run_package(destination, selected, groups=['kline'], symbols=['BTCUSDT', 'DOGEUSDT'], start=20251215, end=20260201, max_file_size=8*1024*1024)

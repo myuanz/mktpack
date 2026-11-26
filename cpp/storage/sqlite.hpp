@@ -1,6 +1,7 @@
 #pragma once
 #include "database.hpp"
 #include <mktpack/storage.hpp>
+#include <memory>
 
 namespace mktpack::storage {
 struct GroupSpec {
