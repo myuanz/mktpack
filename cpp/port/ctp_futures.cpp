@@ -794,9 +794,9 @@ std::vector<Source> discover(const std::vector<fs::path>& roots,int start,int en
     std::vector<Source> files;
     for (const auto& root:roots) {
         const auto dir=root/"tick"/"future";
-        for (const auto& entry:fs::recursive_directory_iterator(dir)) {
+        auto accept=[&](const fs::directory_entry& entry) {
             auto name=entry.path().filename().string();
-            if (!name.starts_with("FUTURE_TICK_") || !name.ends_with(".csv.zip")) continue;
+            if (!name.starts_with("FUTURE_TICK_") || !name.ends_with(".csv.zip")) return;
             auto pos=name.rfind('_');
             constexpr View prefix="FUTURE_TICK_";
             auto key=View(name).substr(prefix.size(),pos-prefix.size());
@@ -806,11 +806,28 @@ std::vector<Source> discover(const std::vector<fs::path>& roots,int start,int en
                 auto first=key.substr(0,split);
                 auto rest=split==key.npos?View{}:key.substr(split+1);
                 if (!products.contains(std::string(first)) &&
-                    !products.contains(std::string(rest.substr(0,rest.find('_'))))) continue;
+                    !products.contains(std::string(rest.substr(0,rest.find('_'))))) return;
             }
             const auto period=date_number(name.substr(pos+1,name.size()-pos-9));
             if (start<=period && period<end)
                 files.push_back({entry.path(),root.filename().string()+"/"+name.substr(0,pos),period});
+        };
+        if(start && end!=INT_MAX) {
+            const auto first=std::chrono::sys_days(std::chrono::year(start/10000)/((start/100)%100)/(start%100));
+            const auto last=std::chrono::sys_days(std::chrono::year(end/10000)/((end/100)%100)/(end%100));
+            for(auto date=first;date<last;date+=std::chrono::days(1)) {
+                const std::chrono::year_month_day ymd(date);
+                auto part=[](unsigned value) {
+                    std::string text(2,'0');
+                    text[0]=static_cast<char>('0'+value/10);
+                    text[1]=static_cast<char>('0'+value%10);
+                    return text;
+                };
+                const auto daily=dir/std::to_string(int(ymd.year()))/part(unsigned(ymd.month()))/part(unsigned(ymd.day()));
+                if(fs::is_directory(daily))for(const auto& entry:fs::directory_iterator(daily))accept(entry);
+            }
+        } else {
+            for (const auto& entry:fs::recursive_directory_iterator(dir)) accept(entry);
         }
     }
     std::sort(files.begin(),files.end(),[](const Source& a,const Source& b){return std::tie(a.day,a.series)<std::tie(b.day,b.series);});

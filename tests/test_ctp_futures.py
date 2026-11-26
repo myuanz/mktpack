@@ -131,6 +131,15 @@ def test_mirror_suffix_independent_of_filename_format(tmp_path):
     assert sorted(mktpack.open(root)['tick'].read(columns=['symbol'])['symbol'].to_pylist()) == ['AP2701', 'L2612F']
 
 
+def test_bounded_discovery_only_visits_requested_date_directories(tmp_path):
+    mirror, root = tmp_path/'mirror', tmp_path/'data'
+    row = tick('CZCE', 'AP701', 1793581200000, '6600', 3)
+    archive(mirror/'nfs_rq/tick/future/2026/11/02/FUTURE_TICK_AP_20261102.csv.zip', list(row), [row])
+    archive(mirror/'nfs_rq/tick/future/2026/11/03/FUTURE_TICK_AP_invalid.csv.zip', list(row), [row])
+    result = cli(root, 'ctp-futures', 'import', mirror, '--start', '2026-11-02', '--end', '2026-11-03')
+    assert result['blocks'] == 1
+
+
 def test_completed_months_use_separate_volumes(tmp_path):
     mirror, root = tmp_path/'mirror', tmp_path/'data'
     for day in (20260901, 20261008):
