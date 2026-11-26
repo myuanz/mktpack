@@ -7,6 +7,7 @@
 #include <memory>
 #include <numeric>
 #include <set>
+#include <utility>
 namespace mktpack {
 namespace detail {
 void check(bool b,const char* m) { if(!b) throw std::runtime_error(m); }
@@ -145,7 +146,9 @@ void set_taker_encoding(Json& schema,bool enabled) {
     }
 }
 
-std::vector<uint8_t> encode(const Table& table) {
+template<class Input>
+static std::vector<uint8_t> encode_impl(Input&& input) {
+    const Table& table=input;
     check(table.columns.contains("time"),"缺少 time");
     const auto& time=table.columns.at("time");
     const size_t rows=time.size();
@@ -170,7 +173,7 @@ std::vector<uint8_t> encode(const Table& table) {
         return spec.value("encoding","")=="ratio_1000";
     });
     if (!ohlc && !ratio) {
-        encode_block(table,header,payload);
+        encode_block(std::forward<Input>(input).columns,std::forward<Input>(input).schema,header,payload);
         return assemble(header,payload);
     }
     auto columns=table.columns;
@@ -266,6 +269,9 @@ std::vector<uint8_t> encode(const Table& table) {
     }
     return assemble(header,payload);
 }
+
+std::vector<uint8_t> encode(const Table& table) {return encode_impl(table);}
+std::vector<uint8_t> encode(Table&& table) {return encode_impl(std::move(table));}
 static Table decode_selected(const Bytes& bytes,const std::vector<std::string>* requested) {
     auto [description,offset]=header(bytes);
     const bool predictive=std::any_of(description.at("columns").begin(),description.at("columns").end(),[](const auto& d) {

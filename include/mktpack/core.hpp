@@ -9,6 +9,7 @@ using Json=nlohmann::json;
 using Columns=std::map<std::string,std::vector<int64_t>>;
 struct Table { Columns columns; Json schema=Json::object(); Json metadata=Json::object(); };
 std::vector<uint8_t> encode(const Table& table);
+std::vector<uint8_t> encode(Table&& table);
 Table decode(const std::vector<uint8_t>& bytes);
 Table decode(const std::vector<uint8_t>& bytes,const std::vector<std::string>& requested);
 Json info(const std::filesystem::path& path);

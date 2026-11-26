@@ -7,7 +7,7 @@ struct Options {
     std::filesystem::path profile;
     std::vector<std::string> symbols;
     std::string start, end;
-    size_t jobs=4;
+    size_t jobs=16;
 };
 
 Json import_ticks(const Options& options);

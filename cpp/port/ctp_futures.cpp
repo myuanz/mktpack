@@ -11,12 +11,18 @@
 #include <cmath>
 #include <climits>
 #include <cctype>
+#include <condition_variable>
 #include <functional>
 #include <fstream>
 #include <future>
 #include <deque>
+#include <mutex>
 #include <numeric>
+#include <optional>
+#include <queue>
 #include <set>
+#include <span>
+#include <thread>
 
 namespace mktpack::ctp_futures {
 namespace {
@@ -28,28 +34,28 @@ using Row=std::vector<View>;
 
 enum class Stage:size_t {
     discover,catalog,index_open,source_total,source_index,source_read,csv_parse_build,
-    block_finish,mkp_encode,mkp_write,encode_wait,publish_index,source_commit,
+    block_finish,mkp_encode,mkp_write,source_wait,publish_index,source_commit,
     archive_scan,month_total,month_read,month_insert,month_commit,
-    year_total,year_read,year_insert,year_commit,count
+    year_total,year_read,year_insert,year_commit,bulk_total,bulk_commit,count
 };
 
 constexpr std::array stage_names={
     "discover","catalog","index_open","source_total","source_index","source_read","csv_parse_build",
-    "block_finish","mkp_encode","mkp_write","encode_wait","publish_index","source_commit",
+    "block_finish","mkp_encode","mkp_write","source_wait","publish_index","source_commit",
     "archive_scan","month_total","month_read","month_insert","month_commit",
-    "year_total","year_read","year_insert","year_commit"
+    "year_total","year_read","year_insert","year_commit","bulk_total","bulk_commit"
 };
 
 enum class Counter:size_t {
     source_files,csv_rows,csv_compressed_bytes,csv_bytes,imported_sources,skipped_sources,
     blocks,rows,mkp_bytes,month_days,month_read_bytes,month_write_bytes,
-    year_days,year_read_bytes,year_write_bytes,count
+    year_days,year_read_bytes,year_write_bytes,bulk_days,bulk_bytes,count
 };
 
 constexpr std::array counter_names={
     "source_files","csv_rows","csv_compressed_bytes","csv_bytes","imported_sources","skipped_sources",
     "blocks","rows","mkp_bytes","month_days","month_read_bytes","month_write_bytes",
-    "year_days","year_read_bytes","year_write_bytes"
+    "year_days","year_read_bytes","year_write_bytes","bulk_days","bulk_bytes"
 };
 
 class Profile {
@@ -440,23 +446,201 @@ struct DayBlock {
 struct Source {fs::path path;std::string series;int day;};
 struct Stats {int64_t imported=0,skipped=0,blocks=0,rows=0;};
 
-void attach_volume(Database& db,const std::string& path) {
+std::string tick_volume(const std::string& symbol,int period) {
+    return (fs::path("tick")/symbol/(std::to_string(period)+".data")).string();
+}
+
+int64_t volume_id(Database& db,const std::string& path);
+void insert_blob(Statement& insert,int64_t id,const std::vector<uint8_t>& bytes);
+
+template<class Write>
+void with_volume(Database& db,const std::string& path,Write write_rows) {
     const auto file=db.root/fs::path(path);
     fs::create_directories(file.parent_path());
     {
         Statement attach(db,"ATTACH DATABASE ? AS ctp_volume");
         attach.text(1,file.string());attach.next();
     }
-    db.exec("PRAGMA ctp_volume.journal_mode=MEMORY;PRAGMA ctp_volume.synchronous=OFF;PRAGMA ctp_volume.locking_mode=EXCLUSIVE");
+    try {
+        db.exec("PRAGMA ctp_volume.journal_mode=MEMORY;PRAGMA ctp_volume.synchronous=OFF;PRAGMA ctp_volume.locking_mode=EXCLUSIVE");
+        write_rows();
+    } catch(...) {
+        db.exec("DETACH DATABASE ctp_volume");
+        throw;
+    }
+    db.exec("DETACH DATABASE ctp_volume");
 }
 
-class Sources {
+using Symbols=std::set<std::string>;
+
+struct EncodedBlock {
+    std::string symbol;
+    std::vector<uint8_t> scales;
+    int64_t first,last;
+    size_t rows;
+    std::vector<uint8_t> bytes;
+};
+
+struct PreparedSource {
+    const Source& source;
+    std::vector<EncodedBlock> blocks;
+};
+
+struct ImportPlan {
+    bool backfill;
+    std::vector<const Source*> sources;
+    std::map<int,Symbols> existing;
+};
+
+class SourceResults {
+    using Task=std::packaged_task<PreparedSource()>;
+    const Catalog& catalog;
+    const std::vector<Field>& names;
+    const Symbols& wanted;
+    Profile& profile;
+    const std::map<int,Symbols>& existing;
+    std::span<const Source* const> remaining;
+    std::mutex mutex;
+    std::condition_variable_any ready;
+    std::queue<Task> tasks;
+    std::deque<std::future<PreparedSource>> pending;
+    int write_day=0;
+    Symbols written;
+    std::vector<std::jthread> workers; // 先结束线程，再销毁任务队列。
+
+    PreparedSource prepare(const Source& source,const Symbols* existing) {
+        auto source_timer=profile.scope(Stage::source_total);
+        Header header;std::vector<size_t> positions;
+        size_t exchange=0,instrument=0,uid=0;
+        std::map<std::string,DayBlock,std::less<>> blocks;
+        std::map<std::pair<std::string,std::string>,DayBlock*> by_id;
+        auto alias=by_id.end();
+        CsvInput csv([&](const Row& row){
+            if (header.positions.empty()) {
+                header.set(row);
+                exchange=header.at("exchange_id"); instrument=header.at("instrument_id");
+                uid=header.positions.contains("unique_instrument_id")?header.at("unique_instrument_id"):row.size();
+                for (const auto& field:names)
+                    positions.push_back(field.name=="trading_day"?0:header.at(field.name=="time"?"trade_timestamp":field.name));
+                return;
+            }
+            const auto exchange_name=row.at(exchange),instrument_name=row.at(instrument);
+            if(alias==by_id.end() || alias->first.first!=exchange_name || alias->first.second!=instrument_name) {
+                auto key=std::make_pair(std::string(exchange_name),std::string(instrument_name));
+                alias=by_id.find(key);
+                if (alias==by_id.end()) {
+                    auto item=catalog.resolve(key.first,key.second,uid<row.size()?row[uid]:View{},source.day);
+                    if (item.name.empty() || item.name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")!=std::string::npos)
+                        throw std::runtime_error("无效合约代码："+item.name);
+                    auto [it,fresh]=blocks.try_emplace(item.name);
+                    if (fresh) {
+                        it->second.contract=item;
+                        if ((wanted.empty() || wanted.contains(item.name)) &&
+                            (!existing || !existing->contains(item.name)))
+                            it->second.columns.resize(names.size());
+                    }
+                    alias=by_id.emplace(std::move(key),&it->second).first;
+                }
+            }
+            if (!alias->second->columns.empty()) alias->second->append(row,names,positions,source.day);
+        },profile.enabled());
+        CsvInput::Stats csv_stats;
+        {
+            auto timer=profile.scope(Stage::source_read);
+            csv_stats=csv.read(source.path);
+        }
+        profile.add(Stage::csv_parse_build,std::chrono::nanoseconds(csv_stats.parse_ns));
+        profile.count(Counter::csv_rows,csv_stats.lines?csv_stats.lines-1:0);
+        profile.count(Counter::csv_compressed_bytes,csv_stats.compressed);
+        profile.count(Counter::csv_bytes,csv_stats.uncompressed);
+        if (header.positions.empty()) throw std::runtime_error("缺少 CSV 表头："+source.path.string());
+
+        PreparedSource prepared{source,{}};
+        for (auto& [symbol,block]:blocks) if (!block.columns.empty()) {
+            Table table;
+            {
+                auto timer=profile.scope(Stage::block_finish);
+                table=block.finish(names,source.day);
+            }
+            std::vector<uint8_t> scales;
+            scales.reserve(names.size());
+            for(const auto& field:names)scales.push_back(table.schema.at(field.name).at("scale").get<int>());
+            const auto& time=table.columns.at("time");
+            const auto first=time.front(),last=time.back();
+            const auto rows=time.size();
+            std::vector<uint8_t> bytes;
+            {
+                auto timer=profile.scope(Stage::mkp_encode);
+                bytes=encode(std::move(table));
+            }
+            profile.count(Counter::mkp_bytes,bytes.size());
+            prepared.blocks.push_back({symbol,std::move(scales),first,last,rows,std::move(bytes)});
+        }
+        return prepared;
+    }
+
+    void work(std::stop_token stop) {
+        for(;;) {
+            Task task;
+            {
+                std::unique_lock lock(mutex);
+                ready.wait(lock,stop,[&] {return !tasks.empty();});
+                if(stop.stop_requested())return;
+                task=std::move(tasks.front());
+                tasks.pop();
+            }
+            task();
+        }
+    }
+    void schedule() {
+        if(remaining.empty())return;
+        const auto* source=remaining.front();
+        remaining=remaining.subspan(1);
+        const auto day=existing.find(source->day);
+        const auto* known=day==existing.end()?nullptr:&day->second;
+        Task task([this,source,known] {return prepare(*source,known);});
+        pending.push_back(task.get_future());
+        {
+            std::lock_guard lock(mutex);
+            tasks.push(std::move(task));
+        }
+        ready.notify_one();
+    }
+public:
+    SourceResults(const ImportPlan& plan,const Catalog& contracts,const std::vector<Field>& fields,
+                  const Symbols& requested,Profile& profiler,size_t jobs)
+        :catalog(contracts),names(fields),wanted(requested),profile(profiler),
+         existing(plan.existing),remaining(plan.sources) {
+        const auto count=std::min(jobs,remaining.size());
+        workers.reserve(count);
+        for(size_t i=0;i<count;++i)workers.emplace_back([this](std::stop_token stop) {work(stop);});
+        for(size_t i=0;i<count;++i)schedule();
+    }
+    PreparedSource take() {
+        auto prepared=[&] {
+            auto timer=profile.scope(Stage::source_wait);
+            return pending.front().get();
+        }();
+        pending.pop_front();
+        schedule();
+        if(prepared.source.day!=write_day) {
+            write_day=prepared.source.day;
+            written.clear();
+        }
+        // 同日多个源包可能在前一包提交前完成编码。
+        std::erase_if(prepared.blocks,[&](const auto& block) {return !written.insert(block.symbol).second;});
+        return prepared;
+    }
+};
+
+class TickWriter {
+    struct Day {int period;const EncodedBlock* block;};
     Database& db;
     Profile& profile;
+    Stats& stats;
+    const std::vector<Field>& names;
     int64_t group;
-    size_t jobs;
-    const std::set<std::string>& wanted;
-    const std::vector<Field> names=fields();
+    bool complete_sources;
     Json group_schema;
     std::map<std::string,int64_t> symbol_keys;
 
@@ -466,19 +650,6 @@ class Sources {
         Statement find(db,"SELECT id FROM __ctp_futures_series__ WHERE name=?");
         find.text(1,series);find.next();return find.integer(0);
     }
-    bool needed(int64_t series,int day) {
-        Statement q(db,"SELECT 1 FROM __ctp_futures_files__ WHERE series_id=? AND period=?");
-        q.integer(1,series);q.integer(2,day);
-        return !q.next();
-    }
-    std::set<std::string> loaded(int day) {
-        std::set<std::string> result;
-        Statement q(db,"SELECT s.name FROM __timefile__ f JOIN __symbols__ s ON s.id=f.symbol_id "
-                "WHERE f.group_id=? AND f.period=?");
-        q.integer(1,group);q.integer(2,day);
-        while(q.next())result.insert(q.text(0));
-        return result;
-    }
     int64_t symbol_id(const std::string& symbol) {
         auto found=symbol_keys.find(symbol);
         if(found!=symbol_keys.end())return found->second;
@@ -486,21 +657,89 @@ class Sources {
         symbol_keys.emplace(symbol,id);
         return id;
     }
-    void publish(const Table& t,int64_t symbol,int period) {
-        const auto& time=t.columns.at("time");
-        Statement target(db,"INSERT INTO __timefile__(group_id,symbol_id,period,first_time,last_time,rows) VALUES(?,?,?,?,?,?)");
-        target.integer(1,group);target.integer(2,symbol);target.integer(3,period);
-        target.integer(4,time.front());target.integer(5,time.back());target.integer(6,time.size());target.next();
+    int64_t publish(const EncodedBlock& block,int day,std::optional<int64_t> volume,Json& logical) {
+        auto timer=profile.scope(Stage::publish_index);
+        Statement target(db,"INSERT INTO __timefile__(group_id,symbol_id,period,first_time,last_time,rows,volume_id) "
+                            "VALUES(?,?,?,?,?,?,?)");
+        target.integer(1,group);target.integer(2,symbol_id(block.symbol));target.integer(3,day);
+        target.integer(4,block.first);target.integer(5,block.last);target.integer(6,block.rows);
+        if(volume)target.integer(7,*volume);
+        target.next();
+        for(size_t i=0;i<names.size();++i) {
+            auto& scale=logical.at(names[i].name).at("scale");
+            if(block.scales[i]>scale.get<int>())scale=block.scales[i];
+        }
+        stats.rows+=block.rows;++stats.blocks;
+        profile.count(Counter::rows,block.rows);profile.count(Counter::blocks);
+        return sqlite3_last_insert_rowid(db.db);
     }
-    void merge_schema(Json& logical,const Table& table) {
-        for(const auto& [name,column]:table.schema.items()) {
-            auto& spec=logical[name];
-            const int scale=spec.is_null()?0:spec.value("scale",0);
-            spec={{"type",column.at("type")},{"scale",std::max(scale,column.value("scale",0))}};
+
+    template<class Write>
+    void transaction(Stage stage,Write write_rows) {
+        auto next_schema=group_schema;
+        db.exec("BEGIN IMMEDIATE");
+        try {
+            write_rows(next_schema);
+            if(next_schema!=group_schema) {
+                Statement update(db,"UPDATE __group__ SET schema=? WHERE id=?");
+                update.text(1,next_schema.dump());update.integer(2,group);update.next();
+            }
+            {auto timer=profile.scope(stage);db.exec("COMMIT");}
+        } catch (...) {
+            db.exec("ROLLBACK");
+            throw;
+        }
+        group_schema=std::move(next_schema);
+    }
+    void finish_source(const PreparedSource& prepared) {
+        if(complete_sources) {
+            Statement file(db,"INSERT INTO __ctp_futures_files__(series_id,period) VALUES(?,?)");
+            file.integer(1,series_id(prepared.source.series));file.integer(2,prepared.source.day);file.next();
+        }
+        if(!prepared.blocks.empty()) {++stats.imported;profile.count(Counter::imported_sources);}
+        else {++stats.skipped;profile.count(Counter::skipped_sources);}
+    }
+
+    void write_loose(std::span<const Day> days,std::span<const PreparedSource> sources,Stage stage) {
+        std::vector<fs::path> publishing;
+        publishing.reserve(days.size());
+        try {
+            transaction(stage,[&](Json& logical) {
+                for(const auto& [day,block]:days) {
+                    publish(*block,day,std::nullopt,logical);
+                    const auto& path=publishing.emplace_back(db.root/"tick"/block->symbol/(std::to_string(day)+".mkp"));
+                    auto timer=profile.scope(Stage::mkp_write);
+                    write(path,block->bytes);
+                }
+                for(const auto& source:sources)finish_source(source);
+            });
+        } catch(...) {
+            for(const auto& path:publishing) {
+                std::error_code ec;
+                fs::remove(path,ec);
+                fs::remove(path.string()+".tmp",ec);
+            }
+            throw;
         }
     }
+    void write_volume(const std::string& path,const std::vector<Day>& days) {
+        with_volume(db,path,[&] {
+            transaction(Stage::bulk_commit,[&](Json& logical) {
+                db.exec("CREATE TABLE IF NOT EXISTS ctp_volume.blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
+                const auto volume=volume_id(db,path);
+                Statement insert(db,"INSERT INTO ctp_volume.blob(id,bytes) VALUES(?,?)");
+                for(const auto& [day,block]:days) {
+                    const auto id=publish(*block,day,volume,logical);
+                    insert_blob(insert,id,block->bytes);
+                    profile.count(Counter::bulk_days);
+                    profile.count(Counter::bulk_bytes,block->bytes.size());
+                }
+            });
+        });
+    }
 public:
-    Sources(Database& database,Profile& profiler,const std::set<std::string>& requested,size_t concurrency):db(database),profile(profiler),group(storage::group_id(db,"tick")),jobs(concurrency),wanted(requested) {
+    TickWriter(Database& database,Profile& profiler,Stats& result,const std::vector<Field>& fields,bool complete)
+        :db(database),profile(profiler),stats(result),names(fields),group(storage::group_id(db,"tick")),complete_sources(complete) {
         Json logical={{"symbol",{{"type","string"}}}};
         const auto specs=schema(names,0);
         for (const auto& [name,spec]:specs.items()) {
@@ -511,129 +750,79 @@ public:
         Statement current(db,"SELECT schema FROM __group__ WHERE id=?");
         current.integer(1,group);current.next();group_schema=Json::parse(current.text(0));
     }
-    void import(const Source& source,const Catalog& catalog,Stats& stats) {
-        auto source_timer=profile.scope(Stage::source_total);
-        db.exec("BEGIN IMMEDIATE");
-        std::vector<fs::path> publishing;
-        try {
-            auto commit=[&] {
-                auto timer=profile.scope(Stage::source_commit);
-                db.exec("COMMIT");
-            };
-            int64_t series;
-            std::set<std::string> existing;
-            bool pending_source;
-            {
-                auto timer=profile.scope(Stage::source_index);
-                series=series_id(source.series);
-                pending_source=needed(series,source.day);
-                if(pending_source)existing=loaded(source.day);
-            }
-            if(!pending_source) {commit();++stats.skipped;profile.count(Counter::skipped_sources);return;}
 
-            Header header;std::vector<size_t> positions;
-            size_t exchange=0,instrument=0,uid=0;
-            std::map<std::string,DayBlock,std::less<>> blocks;
-            // 输入的行缓冲复用，缓存合约标识时持有字符串。
-            std::map<std::pair<std::string,std::string>,DayBlock*> by_id;
-            auto alias=by_id.end();
-            CsvInput csv([&](const Row& row){
-                if (header.positions.empty()) {
-                    header.set(row);
-                    exchange=header.at("exchange_id"); instrument=header.at("instrument_id");
-                    uid=header.positions.contains("unique_instrument_id")?header.at("unique_instrument_id"):row.size();
-                    for (const auto& field:names)
-                        positions.push_back(field.name=="trading_day"?0:header.at(field.name=="time"?"trade_timestamp":field.name));
-                    return;
-                }
-                const auto exchange_name=row.at(exchange),instrument_name=row.at(instrument);
-                if(alias==by_id.end() || alias->first.first!=exchange_name || alias->first.second!=instrument_name) {
-                    auto key=std::make_pair(std::string(exchange_name),std::string(instrument_name));
-                    alias=by_id.find(key);
-                    if (alias==by_id.end()) {
-                        auto item=catalog.resolve(key.first,key.second,uid<row.size()?row[uid]:View{},source.day);
-                        if (item.name.empty() || item.name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")!=std::string::npos)
-                            throw std::runtime_error("无效合约代码："+item.name);
-                        auto [it,fresh]=blocks.try_emplace(item.name);
-                        if (fresh) {
-                            it->second.contract=item;
-                            if ((wanted.empty() || wanted.contains(item.name)) &&
-                                !existing.contains(item.name))
-                                it->second.columns.resize(names.size());
-                        }
-                        alias=by_id.emplace(std::move(key),&it->second).first;
-                    }
-                }
-                if (!alias->second->columns.empty()) alias->second->append(row,names,positions,source.day);
-            },profile.enabled());
-            CsvInput::Stats csv_stats;
-            {auto timer=profile.scope(Stage::source_read);csv_stats=csv.read(source.path);}
-            profile.add(Stage::csv_parse_build,std::chrono::nanoseconds(csv_stats.parse_ns));
-            profile.count(Counter::csv_rows,csv_stats.lines?csv_stats.lines-1:0);
-            profile.count(Counter::csv_compressed_bytes,csv_stats.compressed);
-            profile.count(Counter::csv_bytes,csv_stats.uncompressed);
-            if (header.positions.empty()) throw std::runtime_error("缺少 CSV 表头："+source.path.string());
-            const auto ymd=std::to_string(source.day);
-            bool changed=false;
-            struct Prepared {std::string symbol;Table table;};
-            std::deque<std::future<Prepared>> pending;
-            auto next_schema=group_schema;
-            auto collect=[&] {
-                auto prepared=[&] {
-                    auto timer=profile.scope(Stage::encode_wait);
-                    return pending.front().get();
-                }();
-                pending.pop_front();
-                auto timer=profile.scope(Stage::publish_index);
-                const auto sid=symbol_id(prepared.symbol);
-                publish(prepared.table,sid,source.day);
-                merge_schema(next_schema,prepared.table);
-                changed=true;stats.rows+=prepared.table.columns.at("time").size();++stats.blocks;
-                profile.count(Counter::rows,prepared.table.columns.at("time").size());
-                profile.count(Counter::blocks);
-            };
-            for (auto& [symbol,block]:blocks) {
-                if (!block.columns.empty()) {
-                    auto path=db.root/"tick"/symbol/(ymd+".mkp");
-                    publishing.push_back(path);
-                    pending.push_back(std::async(jobs==1?std::launch::deferred:std::launch::async,
-                        [this,symbol,path,day=source.day,block=std::move(block)]() mutable {
-                            auto table=[&] {
-                                auto timer=profile.scope(Stage::block_finish);
-                                return block.finish(names,day);
-                            }();
-                            auto bytes=[&] {
-                                auto timer=profile.scope(Stage::mkp_encode);
-                                return encode(table);
-                            }();
-                            profile.count(Counter::mkp_bytes,bytes.size());
-                            {auto timer=profile.scope(Stage::mkp_write);write(path,bytes);}
-                            return Prepared{symbol,std::move(table)};
-                        }));
-                    if(pending.size()>=jobs)collect();
-                }
-            }
-            while(!pending.empty())collect();
-            if(next_schema!=group_schema) {
-                Statement update(db,"UPDATE __group__ SET schema=? WHERE id=?");
-                update.text(1,next_schema.dump());update.integer(2,group);update.next();
-            }
-            if(wanted.empty()) {
-                Statement file(db,"INSERT INTO __ctp_futures_files__(series_id,period) VALUES(?,?)");
-                file.integer(1,series);file.integer(2,source.day);file.next();
-            }
-            commit();
-            group_schema=std::move(next_schema);
-            if(changed) {++stats.imported;profile.count(Counter::imported_sources);}
+    ImportPlan plan(const std::vector<Source>& files) {
+        auto timer=profile.scope(Stage::source_index);
+        Statement present(db,"SELECT 1 FROM __timefile__ WHERE group_id=? LIMIT 1");
+        present.integer(1,group);
+        ImportPlan plan{!present.next(),{},{}};
+        Statement needed(db,"SELECT 1 FROM __ctp_futures_files__ f JOIN __ctp_futures_series__ s ON s.id=f.series_id "
+                            "WHERE s.name=? AND f.period=?");
+        for(const auto& source:files) {
+            needed.text(1,source.series);needed.integer(2,source.day);
+            if(!needed.next())plan.sources.push_back(&source);
             else {++stats.skipped;profile.count(Counter::skipped_sources);}
-        } catch (...) {
-            for (const auto& path:publishing) {
-                std::error_code ec;fs::remove(path,ec);fs::remove(path.string()+".tmp",ec);
-            }
-            db.exec("ROLLBACK");symbol_keys.clear();throw;
+            sqlite3_reset(needed.statement);
         }
+        if(plan.backfill || plan.sources.empty())return plan;
+
+        for(const auto* source:plan.sources)plan.existing.try_emplace(source->day);
+        Statement loaded(db,"SELECT f.period,s.name FROM __timefile__ f JOIN __symbols__ s ON s.id=f.symbol_id "
+                            "WHERE f.group_id=? AND f.period BETWEEN ? AND ?");
+        loaded.integer(1,group);loaded.integer(2,plan.sources.front()->day);loaded.integer(3,plan.sources.back()->day);
+        while(loaded.next()) {
+            const auto day=plan.existing.find(int(loaded.integer(0)));
+            if(day!=plan.existing.end())day->second.insert(loaded.text(1));
+        }
+        return plan;
+    }
+    void write_source(const PreparedSource& source) {
+        std::vector<Day> days;
+        days.reserve(source.blocks.size());
+        for(const auto& block:source.blocks)days.push_back({source.source.day,&block});
+        write_loose(days,std::span(&source,1),Stage::source_commit);
+    }
+    void write_year(std::span<const PreparedSource> sources,const Catalog& catalog,int today) {
+        if(sources.empty())return;
+        auto timer=profile.scope(Stage::bulk_total);
+        std::map<std::string,std::vector<Day>> volumes;
+        std::vector<Day> loose;
+        for(const auto& source:sources) {
+            const int day=source.source.day;
+            for(const auto& block:source.blocks) {
+                if(day/10000<today/10000 || catalog.expired(block.symbol,today))
+                    volumes[tick_volume(block.symbol,day/10000)].push_back({day,&block});
+                else if(day/100<today/100)
+                    volumes[tick_volume(block.symbol,day/100)].push_back({day,&block});
+                else
+                    loose.push_back({day,&block});
+            }
+        }
+        for(const auto& [path,days]:volumes)write_volume(path,days);
+        write_loose(loose,sources,Stage::bulk_commit);
     }
 };
+
+void write_import(TickWriter& writer,const ImportPlan& plan,SourceResults& results,const Catalog& catalog,int today) {
+    if(!plan.backfill) {
+        for(size_t i=0;i<plan.sources.size();++i)writer.write_source(results.take());
+        return;
+    }
+    std::vector<PreparedSource> year;
+    for(const auto* source:plan.sources) {
+        if(!year.empty() && year.front().source.day/10000!=source->day/10000) {
+            writer.write_year(year,catalog,today);
+            year.clear();
+        }
+        try {
+            year.push_back(results.take());
+        } catch(...) {
+            writer.write_year(year,catalog,today);
+            throw;
+        }
+    }
+    writer.write_year(year,catalog,today);
+}
 
 struct StoredDay {int64_t id,volume;std::string symbol,path;int period;};
 
@@ -670,32 +859,33 @@ void insert_blob(Statement& insert,int64_t id,const std::vector<uint8_t>& bytes)
 void archive_month(Database& db,Profile& profile,const std::string& path,const std::vector<StoredDay>& days) {
     auto total=profile.scope(Stage::month_total);
     profile.count(Counter::month_days,days.size());
-    attach_volume(db,path);
     std::vector<fs::path> loose;
-    bool transaction=false;
-    try {
-        db.exec("BEGIN IMMEDIATE");transaction=true;
-        db.exec("CREATE TABLE IF NOT EXISTS ctp_volume.blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
-        Statement insert(db,"INSERT INTO ctp_volume.blob(id,bytes) VALUES(?,?)");
-        const auto volume=volume_id(db,path);
-        Statement update(db,"UPDATE __timefile__ SET volume_id=? WHERE id=? AND volume_id IS NULL");
-        for(const auto& day:days) {
-            const auto source=db.root/"tick"/day.symbol/(std::to_string(day.period)+".mkp");
-            std::vector<uint8_t> bytes;
-            {auto timer=profile.scope(Stage::month_read);bytes=file_bytes(source);}
-            profile.count(Counter::month_read_bytes,bytes.size());
-            {auto timer=profile.scope(Stage::month_insert);insert_blob(insert,day.id,bytes);}
-            profile.count(Counter::month_write_bytes,bytes.size());
-            update.integer(1,volume);update.integer(2,day.id);update.next();sqlite3_reset(update.statement);
-            loose.push_back(source);
+    loose.reserve(days.size());
+    with_volume(db,path,[&] {
+        db.exec("BEGIN IMMEDIATE");
+        try {
+            db.exec("CREATE TABLE IF NOT EXISTS ctp_volume.blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
+            Statement insert(db,"INSERT INTO ctp_volume.blob(id,bytes) VALUES(?,?)");
+            const auto volume=volume_id(db,path);
+            Statement update(db,"UPDATE __timefile__ SET volume_id=? WHERE id=? AND volume_id IS NULL");
+            for(const auto& day:days) {
+                const auto& source=loose.emplace_back(db.root/"tick"/day.symbol/(std::to_string(day.period)+".mkp"));
+                auto bytes=[&] {
+                    auto timer=profile.scope(Stage::month_read);
+                    return file_bytes(source);
+                }();
+                profile.count(Counter::month_read_bytes,bytes.size());
+                {auto timer=profile.scope(Stage::month_insert);insert_blob(insert,day.id,bytes);}
+                profile.count(Counter::month_write_bytes,bytes.size());
+                update.integer(1,volume);update.integer(2,day.id);update.next();sqlite3_reset(update.statement);
+            }
+            auto timer=profile.scope(Stage::month_commit);
+            db.exec("COMMIT");
+        } catch(...) {
+            db.exec("ROLLBACK");
+            throw;
         }
-        {auto timer=profile.scope(Stage::month_commit);db.exec("COMMIT");transaction=false;}
-    } catch(...) {
-        if(transaction)db.exec("ROLLBACK");
-        db.exec("DETACH DATABASE ctp_volume");
-        throw;
-    }
-    db.exec("DETACH DATABASE ctp_volume");
+    });
     for(const auto& path:loose)fs::remove(path);
 }
 
@@ -762,37 +952,61 @@ void archive_year(Database& index,Profile& profile,const std::string& path,const
 
 void compact_volumes(Database& db,Profile& profile,const Catalog& catalog,int today) {
     const auto group=storage::group_id(db,"tick");
+    const int month_start=today/100*100+1;
+    const int year=today/10000;
     std::map<std::pair<std::string,int>,std::vector<StoredDay>> months;
     {
         auto timer=profile.scope(Stage::archive_scan);
-        Statement q(db,"SELECT f.id,s.name,f.period FROM __timefile__ f JOIN __symbols__ s ON s.id=f.symbol_id "
-                "WHERE f.group_id=? AND f.volume_id IS NULL ORDER BY s.name,f.period");q.integer(1,group);
-        while(q.next()) {
-            StoredDay day{q.integer(0),0,q.text(1),"",int(q.integer(2))};
-            if(day.period/100<today/100 || catalog.expired(day.symbol,today))
-                months[{day.symbol,day.period/100}].push_back(std::move(day));
-        }
+        const std::string loose="SELECT f.id,s.name,f.period FROM __timefile__ f JOIN __symbols__ s ON s.id=f.symbol_id "
+                "WHERE f.group_id=? AND f.volume_id IS NULL AND f.period";
+        auto collect=[&](const std::string& sql,bool require_expired) {
+            Statement q(db,sql);
+            q.integer(1,group);q.integer(2,month_start);
+            while(q.next()) {
+                StoredDay day{q.integer(0),0,q.text(1),"",int(q.integer(2))};
+                if(!require_expired || catalog.expired(day.symbol,today))
+                    months[{day.symbol,day.period/100}].push_back(std::move(day));
+            }
+        };
+        collect(loose+"<? ORDER BY f.period",false);
+        collect(loose+">=? ORDER BY f.period",true);
     }
     for(const auto& [key,days]:months) {
         const auto& [symbol,month]=key;
-        archive_month(db,profile,(fs::path("tick")/symbol/(std::to_string(month)+".data")).string(),days);
+        archive_month(db,profile,tick_volume(symbol,month),days);
     }
 
-    std::map<std::pair<std::string,int>,std::vector<StoredDay>> years;
+    std::set<std::pair<std::string,int>> years;
     {
         auto timer=profile.scope(Stage::archive_scan);
-        Statement q(db,"SELECT f.id,f.volume_id,s.name,f.period,v.path FROM __timefile__ f "
-                "JOIN __symbols__ s ON s.id=f.symbol_id JOIN __volumes__ v ON v.id=f.volume_id "
-                "WHERE f.group_id=? ORDER BY s.name,f.period");q.integer(1,group);
+        Statement q(db,"SELECT path FROM __volumes__ "
+                       "WHERE substr(path,-11) GLOB '[0-9][0-9][0-9][0-9][0-9][0-9].data'");
         while(q.next()) {
-            StoredDay day{q.integer(0),q.integer(1),q.text(2),q.text(4),int(q.integer(3))};
-            if(day.period/10000<today/10000 || catalog.expired(day.symbol,today))
-                years[{day.symbol,day.period/10000}].push_back(std::move(day));
+            const fs::path path=q.text(0);
+            const auto period=path.stem().string();
+            if(period.size()!=6)continue;
+            const int month=int(integer(period));
+            const auto symbol=path.parent_path().filename().string();
+            if(month/100<year || catalog.expired(symbol,today))years.emplace(symbol,month/100);
         }
     }
-    for(const auto& [key,days]:years) {
-        const auto& [symbol,year]=key;
-        const auto path=(fs::path("tick")/symbol/(std::to_string(year)+".data")).string();
+    if(years.empty())return;
+
+    Statement year_days(db,"SELECT f.id,f.volume_id,f.period,v.path FROM __timefile__ f "
+            "JOIN __volumes__ v ON v.id=f.volume_id WHERE f.group_id=? "
+            "AND f.symbol_id=(SELECT id FROM __symbols__ WHERE name=?) "
+            "AND f.period>=? AND f.period<? ORDER BY f.period");
+    for(const auto& [symbol,period]:years) {
+        const auto path=tick_volume(symbol,period);
+        std::vector<StoredDay> days;
+        {
+            auto timer=profile.scope(Stage::archive_scan);
+            year_days.integer(1,group);year_days.text(2,symbol);
+            year_days.integer(3,period*10000);year_days.integer(4,(period+1)*10000);
+            while(year_days.next())days.push_back({year_days.integer(0),year_days.integer(1),symbol,
+                                                  year_days.text(3),int(year_days.integer(2))});
+            sqlite3_reset(year_days.statement);
+        }
         if(std::all_of(days.begin(),days.end(),[&](const auto& day){return day.path==path;}))continue;
         archive_year(db,profile,path,days);
     }
@@ -876,14 +1090,21 @@ static Json import_ticks_impl(const Options& options,Profile& profile) {
     db.exec("PRAGMA journal_mode=MEMORY;PRAGMA synchronous=OFF;PRAGMA locking_mode=EXCLUSIVE;BEGIN EXCLUSIVE");
     storage::create_index(db);
     db.exec("CREATE TABLE IF NOT EXISTS __ctp_futures_series__(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL);"
-            "CREATE TABLE IF NOT EXISTS __ctp_futures_files__(series_id INTEGER,period INTEGER,PRIMARY KEY(series_id,period)) WITHOUT ROWID;");
-    Sources sources(db,profile,symbols,options.jobs);
-    db.exec("COMMIT");
+            "CREATE TABLE IF NOT EXISTS __ctp_futures_files__(series_id INTEGER,period INTEGER,PRIMARY KEY(series_id,period)) WITHOUT ROWID;"
+            "CREATE INDEX IF NOT EXISTS __ctp_futures_loose__ ON __timefile__(group_id,period,symbol_id) WHERE volume_id IS NULL;");
     Stats stats;
+    const auto names=fields();
+    TickWriter writer(db,profile,stats,names,symbols.empty());
+    db.exec("COMMIT");
+    const auto date=std::chrono::year_month_day{std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now()+std::chrono::hours(8))};
+    const int today=int(date.year())*10000+int(unsigned(date.month()))*100+int(unsigned(date.day()));
     profile.count(Counter::source_files,files.size());
-    for (const auto& file:files) sources.import(file,*catalog,stats);
-    auto today=std::chrono::year_month_day{std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now()+std::chrono::hours(8))};
-    compact_volumes(db,profile,*catalog,int(today.year())*10000+int(unsigned(today.month()))*100+int(unsigned(today.day())));
+    const auto plan=writer.plan(files);
+    {
+        SourceResults results(plan,*catalog,names,symbols,profile,options.jobs);
+        write_import(writer,plan,results,*catalog,today);
+    }
+    if(!plan.backfill)compact_volumes(db,profile,*catalog,today);
     return {{"imported",stats.imported},{"skipped",stats.skipped},{"blocks",stats.blocks},{"rows",stats.rows}};
 }
 

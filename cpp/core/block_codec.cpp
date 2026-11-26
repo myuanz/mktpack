@@ -155,9 +155,7 @@ Names dependencies(const Json& d,bool include_previous) {
 }
 }
 
-void encode_block(const Table& table,Json& header,std::vector<Bytes>& payload) {
-    auto columns=table.columns;
-    auto schema=table.schema;
+void encode_block(Columns columns,Json schema,Json& header,std::vector<Bytes>& payload) {
     const auto groups=normalize_prices(columns,schema);
     for (const auto& [name,values]:columns) {
         auto d=schema.at(name);

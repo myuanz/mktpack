@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import subprocess
 import zipfile
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -113,6 +114,26 @@ def test_retry_after_bad_source(tmp_path):
     }
 
 
+def test_completed_source_remains_after_later_failure(tmp_path):
+    mirror, root = tmp_path/'mirror', tmp_path/'data'
+    directory = mirror/'nfs_rq_new/tick/future/2026/11/02'
+    good_path = directory/'FUTURE_TICK_DCE_A_20261102.csv.zip'
+    bad_path = directory/'FUTURE_TICK_DCE_B_20261102.csv.zip'
+    good = tick('DCE', 'a2612', 1793581200000, '4000', 3, 'DCE|F|A|2612')
+    bad = tick('DCE', 'b2612', 1793581200000, '3000', 4, 'DCE|F|B|2612')
+    archive(good_path, list(good), [good])
+    archive(bad_path, list(bad), [dict(bad, bid_volume1='bad')])
+    with pytest.raises(subprocess.CalledProcessError):
+        cli(root, 'ctp-futures', 'import', mirror)
+    with sqlite3.connect(root/'mkt.sqlite') as db:
+        assert db.execute('SELECT count(*) FROM __timefile__').fetchone()[0] == 1
+        assert db.execute('SELECT count(*) FROM __ctp_futures_files__').fetchone()[0] == 1
+    archive(bad_path, list(bad), [bad])
+    result = cli(root, 'ctp-futures', 'import', mirror)
+    assert result['skipped'] == 1
+    assert result['blocks'] == 1
+
+
 
 def test_mirror_suffix_independent_of_filename_format(tmp_path):
     mirror, root = tmp_path/'mirror', tmp_path/'data'
@@ -154,6 +175,24 @@ def test_bounded_discovery_only_visits_requested_date_directories(tmp_path):
     assert result['blocks'] == 1
 
 
+def test_parallel_bulk_and_incremental_match_serial_import(tmp_path):
+    mirror = tmp_path/'mirror'
+    for day in range(2, 6):
+        row = tick('CZCE', 'AP701', 1793581200000+day*1000, '6600', day)
+        archive(mirror/f'nfs_rq/tick/future/2026/11/{day:02d}/FUTURE_TICK_AP_202611{day:02d}.csv.zip',
+                list(row), [row])
+    serial, parallel = tmp_path/'serial', tmp_path/'parallel'
+    args = ('ctp-futures', 'import', mirror, '--start', '2026-11-02', '--end', '2026-11-06')
+    assert cli(serial, *args, '--jobs', '1')['blocks'] == 4
+    assert cli(parallel, *args[:-1], '2026-11-04', '--jobs', '4')['blocks'] == 2
+    for day in (3, 4):
+        duplicate = tick('CZCE', 'AP701', 1793581200000+day*1000, '6600', 100)
+        archive(mirror/f'nfs_rq_new/tick/future/2026/11/{day:02d}/FUTURE_TICK_AP_202611{day:02d}.csv.zip',
+                list(duplicate), [duplicate])
+    assert cli(parallel, *args, '--jobs', '4')['blocks'] == 2
+    assert mktpack.open(serial)['tick'].read().equals(mktpack.open(parallel)['tick'].read())
+
+
 def test_completed_months_use_separate_volumes(tmp_path):
     mirror, root = tmp_path/'mirror', tmp_path/'data'
     for day in (20260901, 20261008):
@@ -166,9 +205,69 @@ def test_completed_months_use_separate_volumes(tmp_path):
     assert measured['status'] == 'ok'
     assert measured['counters']['blocks'] == 2
     assert measured['stages']['mkp_encode']['calls'] == 2
+    assert measured['counters']['bulk_days'] == 2
+    assert 'mkp_write' not in measured['stages']
+    assert 'month_total' not in measured['stages']
     with sqlite3.connect(root/'mkt.sqlite') as db:
         assert db.execute('SELECT period FROM __timefile__ ORDER BY period').fetchall() == [(20260901,), (20261008,)]
         assert db.execute('SELECT path FROM __volumes__ ORDER BY path').fetchall() == [
             ('tick/AP2701/202609.data',), ('tick/AP2701/202610.data',),
         ]
     assert mktpack.open(root)['tick'].read(symbol='AP2701').num_rows == 2
+
+
+def test_historical_bulk_writes_directly_then_incremental_retires_month(tmp_path):
+    mirror, root = tmp_path/'mirror', tmp_path/'data'
+    for day, stamp in ((20240902, 1725238800000), (20241008, 1728349200000)):
+        row = tick('SHFE', 'cu2412', stamp, '70000', day%100)
+        path = mirror/f'nfs_rq/tick/future/2024/{day//100%100:02d}/{day%100:02d}/FUTURE_TICK_CU_{day}.csv.zip'
+        archive(path, list(row), [row])
+
+    def run(start, end, name):
+        profile = tmp_path/name
+        result = cli(root, 'ctp-futures', 'import', mirror, '--start', start, '--end', end, '--profile', profile)
+        assert result['blocks'] == 1
+        return json.loads(profile.read_text())
+
+    bulk = run('2024-09-01', '2024-10-01', 'bulk.json')
+    assert bulk['counters']['bulk_days'] == 1
+    assert bulk['counters']['month_days'] == bulk['counters']['year_days'] == 0
+    assert 'mkp_write' not in bulk['stages']
+    assert sorted(p.name for p in (root/'tick/CU2412').iterdir()) == ['2024.data']
+
+    incremental = run('2024-10-01', '2024-11-01', 'incremental.json')
+    assert incremental['counters']['bulk_days'] == 0
+    assert incremental['counters']['month_days'] == 1
+    assert incremental['counters']['year_days'] == 2
+    assert sorted(p.name for p in (root/'tick/CU2412').iterdir()) == ['2024.data']
+    with sqlite3.connect(root/'mkt.sqlite') as db:
+        assert db.execute('SELECT path FROM __volumes__').fetchall() == [('tick/CU2412/2024.data',)]
+    assert mktpack.open(root)['tick'].read(symbol='CU2412', columns=['volume'])['volume'].to_pylist() == [2, 8]
+
+
+def test_expired_contract_archives_without_new_sources(tmp_path):
+    mirror, root = tmp_path/'mirror', tmp_path/'data'
+    now = datetime.now(UTC)
+    today = (now + timedelta(hours=8)).date()
+    day = f'{today:%Y%m%d}'
+    listing = {
+        'exchangeid': 'SHFE', 'instrumentid': 'cu2612', 'instrumentid_key': 'CU2612',
+        'opendate': '20200101', 'expiredate': f'{today + timedelta(days=30):%Y%m%d}',
+        'volumemultiple': '5',
+    }
+    info = mirror/f'nfs_rq/basicinfo/future_instrument/future_instrument{day}.csv.zip'
+    archive(info, list(listing), [listing])
+    row = tick('SHFE', 'cu2612', int(now.timestamp()*1000), '70000', 1)
+    archive(mirror/f'nfs_rq/tick/future/{today:%Y/%m/%d}/FUTURE_TICK_CU_{day}.csv.zip', list(row), [row])
+    assert cli(root, 'ctp-futures', 'import', mirror)['blocks'] == 1
+    folder = root/'tick/CU2612'
+    assert [p.name for p in folder.iterdir()] == [f'{day}.mkp']
+
+    archive(info, list(listing), [dict(listing, expiredate=f'{today - timedelta(days=1):%Y%m%d}')])
+    profile = tmp_path/'archive.json'
+    result = cli(root, 'ctp-futures', 'import', mirror, '--profile', profile)
+    assert result == {'imported': 0, 'skipped': 1, 'blocks': 0, 'rows': 0}
+    assert [p.name for p in folder.iterdir()] == [f'{today:%Y}.data']
+    assert mktpack.open(root)['tick'].read(symbol='CU2612').num_rows == 1
+    counters = json.loads(profile.read_text())['counters']
+    assert counters['month_days'] == counters['year_days'] == 1
