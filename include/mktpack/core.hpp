@@ -15,6 +15,7 @@ Json info(const std::filesystem::path& path);
 Json info(const std::vector<uint8_t>& bytes);
 Table read(const std::filesystem::path& path);
 void write(const std::filesystem::path& path,const Table& table);
+void write(const std::filesystem::path& path,const std::vector<uint8_t>& bytes);
 Table merge(const std::vector<Table>& tables);
 void merge_files(const std::vector<std::filesystem::path>& paths,const std::filesystem::path& destination);
 int64_t rescale(__int128 value,int from,int to);

@@ -365,9 +365,8 @@ Json info(const std::filesystem::path& path) {
 
 Table read(const std::filesystem::path& path) { return decode(load(path)); }
 
-void write(const std::filesystem::path& path, const Table& table) {
+void write(const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {
     if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
-    const auto bytes=encode(table);
     const auto temporary=path.string()+".tmp";
     {
         std::ofstream output(temporary,std::ios::binary);
@@ -375,6 +374,10 @@ void write(const std::filesystem::path& path, const Table& table) {
         check(bool(output),"写入失败");
     }
     std::filesystem::rename(temporary,path);
+}
+
+void write(const std::filesystem::path& path, const Table& table) {
+    write(path,encode(table));
 }
 
 Table merge(const std::vector<Table>& inputs) {

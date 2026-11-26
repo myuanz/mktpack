@@ -3,6 +3,9 @@
 #include "../storage/database.hpp"
 #include <miniz.h>
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -22,6 +25,121 @@ using storage::Database;
 using storage::Statement;
 using View=std::string_view;
 using Row=std::vector<View>;
+
+enum class Stage:size_t {
+    discover,catalog,index_open,source_total,source_index,source_read,csv_parse_build,
+    block_finish,mkp_encode,mkp_write,encode_wait,publish_index,source_commit,
+    archive_scan,month_total,month_read,month_insert,month_commit,
+    year_total,year_read,year_insert,year_commit,count
+};
+
+constexpr std::array stage_names={
+    "discover","catalog","index_open","source_total","source_index","source_read","csv_parse_build",
+    "block_finish","mkp_encode","mkp_write","encode_wait","publish_index","source_commit",
+    "archive_scan","month_total","month_read","month_insert","month_commit",
+    "year_total","year_read","year_insert","year_commit"
+};
+
+enum class Counter:size_t {
+    source_files,csv_rows,csv_compressed_bytes,csv_bytes,imported_sources,skipped_sources,
+    blocks,rows,mkp_bytes,month_days,month_read_bytes,month_write_bytes,
+    year_days,year_read_bytes,year_write_bytes,count
+};
+
+constexpr std::array counter_names={
+    "source_files","csv_rows","csv_compressed_bytes","csv_bytes","imported_sources","skipped_sources",
+    "blocks","rows","mkp_bytes","month_days","month_read_bytes","month_write_bytes",
+    "year_days","year_read_bytes","year_write_bytes"
+};
+
+class Profile {
+    using Clock=std::chrono::steady_clock;
+    struct Metric {
+        std::atomic<uint64_t> calls{0},total{0},minimum{UINT64_MAX},maximum{0};
+        std::array<std::atomic<uint64_t>,64> histogram{};
+    };
+    fs::path path;
+    Json configuration;
+    Clock::time_point started=Clock::now();
+    std::array<Metric,static_cast<size_t>(Stage::count)> metrics;
+    std::array<std::atomic<uint64_t>,static_cast<size_t>(Counter::count)> counters{};
+
+    static void lower(std::atomic<uint64_t>& target,uint64_t value) {
+        auto old=target.load(std::memory_order_relaxed);
+        while(value<old && !target.compare_exchange_weak(old,value,std::memory_order_relaxed));
+    }
+    static void raise(std::atomic<uint64_t>& target,uint64_t value) {
+        auto old=target.load(std::memory_order_relaxed);
+        while(value>old && !target.compare_exchange_weak(old,value,std::memory_order_relaxed));
+    }
+    static double milliseconds(uint64_t nanoseconds) {return double(nanoseconds)/1'000'000;}
+    static double percentile(const Metric& metric,uint64_t calls,unsigned percent) {
+        const auto target=(calls*percent+99)/100;
+        uint64_t seen=0;
+        for(size_t i=0;i<metric.histogram.size();++i) {
+            seen+=metric.histogram[i].load(std::memory_order_relaxed);
+            if(seen>=target) return i==63?double(UINT64_MAX)/1'000:double(uint64_t(1)<<i)/1'000;
+        }
+        return 0;
+    }
+public:
+    class Scope {
+        Profile* profile=nullptr;
+        Stage stage{};
+        Clock::time_point start;
+    public:
+        Scope(Profile* owner,Stage value):profile(owner),stage(value) {if(profile)start=Clock::now();}
+        Scope(const Scope&)=delete;
+        Scope(Scope&& other) noexcept:profile(other.profile),stage(other.stage),start(other.start) {other.profile=nullptr;}
+        ~Scope() {if(profile)profile->add(stage,Clock::now()-start);}
+    };
+
+    Profile(fs::path output,size_t jobs):path(std::move(output)),configuration{{"jobs",jobs},
+        {"sqlite_journal","PERSIST"}} {}
+    bool enabled() const {return !path.empty();}
+    Scope scope(Stage stage) {return Scope(enabled()?this:nullptr,stage);}
+    void add(Stage stage,Clock::duration duration) {
+        if(!enabled())return;
+        const auto ns=uint64_t(std::max<int64_t>(0,std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count()));
+        auto& metric=metrics[static_cast<size_t>(stage)];
+        metric.calls.fetch_add(1,std::memory_order_relaxed);
+        metric.total.fetch_add(ns,std::memory_order_relaxed);
+        lower(metric.minimum,ns);raise(metric.maximum,ns);
+        const auto us=ns/1'000;
+        const auto bin=std::min<size_t>(63,std::bit_width(us));
+        metric.histogram[bin].fetch_add(1,std::memory_order_relaxed);
+    }
+    void count(Counter counter,uint64_t value=1) {
+        if(enabled())counters[static_cast<size_t>(counter)].fetch_add(value,std::memory_order_relaxed);
+    }
+    void finish(const std::string& status,const std::string& error="") {
+        if(!enabled())return;
+        Json result={{"version",1},{"status",status},
+            {"elapsed_ms",milliseconds(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-started).count())},
+            {"configuration",configuration},
+            {"stages",Json::object()},{"counters",Json::object()}};
+        if(!error.empty())result["error"]=error;
+        for(size_t i=0;i<metrics.size();++i) {
+            const auto calls=metrics[i].calls.load(std::memory_order_relaxed);
+            if(!calls)continue;
+            const auto total=metrics[i].total.load(std::memory_order_relaxed);
+            result["stages"][stage_names[i]]={{"calls",calls},{"total_ms",milliseconds(total)},
+                {"mean_ms",milliseconds(total)/calls},
+                {"min_ms",milliseconds(metrics[i].minimum.load(std::memory_order_relaxed))},
+                {"max_ms",milliseconds(metrics[i].maximum.load(std::memory_order_relaxed))},
+                {"p50_upper_ms",percentile(metrics[i],calls,50)},
+                {"p95_upper_ms",percentile(metrics[i],calls,95)},
+                {"p99_upper_ms",percentile(metrics[i],calls,99)}};
+        }
+        for(size_t i=0;i<counters.size();++i)
+            result["counters"][counter_names[i]]=counters[i].load(std::memory_order_relaxed);
+        if(!path.parent_path().empty())fs::create_directories(path.parent_path());
+        const auto temporary=fs::path(path.string()+".tmp");
+        {std::ofstream output(temporary);output<<result.dump(2)<<'\n';if(!output)throw std::runtime_error("无法写入 profile："+path.string());}
+        fs::remove(path);fs::rename(temporary,path);
+        path.clear();
+    }
+};
 
 std::string upper(View value) {
     std::string result(value);
@@ -77,18 +195,25 @@ void split_row(View line,Row& fields) {
 }
 
 class CsvInput {
+public:
+    struct Stats {uint64_t lines=0,compressed=0,uncompressed=0,parse_ns=0;};
+private:
     std::string pending;
     std::function<void(const Row&)> visit;
     std::exception_ptr error;
     Row fields;
+    bool measure=false;
+    Stats stats;
     void line(View text) {
         if (!text.empty() && text.back()=='\r') text.remove_suffix(1);
         if (text.empty()) return;
         split_row(text,fields);
         visit(fields);
+        ++stats.lines;
     }
     static size_t chunk(void* opaque,mz_uint64,const void* bytes,size_t size) {
         auto& csv=*static_cast<CsvInput*>(opaque);
+        const auto started=csv.measure?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         try {
             View input(static_cast<const char*>(bytes),size);
             size_t end;
@@ -99,27 +224,37 @@ class CsvInput {
                 input.remove_prefix(end+1);
             }
             csv.pending.append(input);
+            if(csv.measure)csv.stats.parse_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();
             return size;
-        } catch (...) {csv.error=std::current_exception();return 0;}
+        } catch (...) {
+            if(csv.measure)csv.stats.parse_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();
+            csv.error=std::current_exception();return 0;
+        }
     }
 public:
-    explicit CsvInput(std::function<void(const Row&)> visitor):visit(std::move(visitor)) {}
-    void read(const fs::path& path) {
+    explicit CsvInput(std::function<void(const Row&)> visitor,bool timed=false):visit(std::move(visitor)),measure(timed) {}
+    Stats read(const fs::path& path) {
         mz_zip_archive zip{};
         if (!mz_zip_reader_init_file(&zip,path.string().c_str(),0)) throw std::runtime_error("无法打开 ZIP："+path.string());
         try {
             const auto member=path.stem().string();
             const auto i=mz_zip_reader_locate_file(&zip,member.c_str(),nullptr,MZ_ZIP_FLAG_IGNORE_PATH);
             if (i<0) throw std::runtime_error("ZIP 缺少 "+member);
+            mz_zip_archive_file_stat stat{};
+            if(!mz_zip_reader_file_stat(&zip,i,&stat))throw std::runtime_error("ZIP 无法读取成员信息");
+            stats.compressed=stat.m_comp_size;stats.uncompressed=stat.m_uncomp_size;
             const auto ok=mz_zip_reader_extract_to_callback(&zip,i,chunk,this,0);
             if (error) std::rethrow_exception(error);
             if (!ok) throw std::runtime_error("ZIP 解压失败");
+            const auto started=measure?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             line(pending);
+            if(measure)stats.parse_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count();
         } catch (const std::exception& ex) {
             mz_zip_reader_end(&zip);
             throw std::runtime_error(path.string()+"："+ex.what());
         }
         mz_zip_reader_end(&zip);
+        return stats;
     }
 };
 
@@ -307,6 +442,7 @@ struct Stats {int64_t imported=0,skipped=0,blocks=0,rows=0;};
 
 class Sources {
     Database& db;
+    Profile& profile;
     int64_t group;
     size_t jobs;
     const std::set<std::string>& wanted;
@@ -354,7 +490,7 @@ class Sources {
         }
     }
 public:
-    Sources(Database& database,const std::set<std::string>& requested,size_t concurrency):db(database),group(storage::group_id(db,"tick")),jobs(concurrency),wanted(requested) {
+    Sources(Database& database,Profile& profiler,const std::set<std::string>& requested,size_t concurrency):db(database),profile(profiler),group(storage::group_id(db,"tick")),jobs(concurrency),wanted(requested) {
         Json logical={{"symbol",{{"type","string"}}}};
         const auto specs=schema(names,0);
         for (const auto& [name,spec]:specs.items()) {
@@ -366,12 +502,24 @@ public:
         current.integer(1,group);current.next();group_schema=Json::parse(current.text(0));
     }
     void import(const Source& source,const Catalog& catalog,Stats& stats) {
+        auto source_timer=profile.scope(Stage::source_total);
         db.exec("BEGIN IMMEDIATE");
         std::vector<fs::path> publishing;
         try {
-            const auto series=series_id(source.series);
-            if (!needed(series,source.day)) {db.exec("COMMIT");++stats.skipped;return;}
-            const auto existing=loaded(source.day);
+            auto commit=[&] {
+                auto timer=profile.scope(Stage::source_commit);
+                db.exec("COMMIT");
+            };
+            int64_t series;
+            std::set<std::string> existing;
+            bool pending_source;
+            {
+                auto timer=profile.scope(Stage::source_index);
+                series=series_id(source.series);
+                pending_source=needed(series,source.day);
+                if(pending_source)existing=loaded(source.day);
+            }
+            if(!pending_source) {commit();++stats.skipped;profile.count(Counter::skipped_sources);return;}
 
             Header header;std::vector<size_t> positions;
             size_t exchange=0,instrument=0,uid=0;
@@ -402,8 +550,13 @@ public:
                     alias=by_id.emplace(std::move(key),&it->second).first;
                 }
                 if (!alias->second->columns.empty()) alias->second->append(row,names,positions,source.day);
-            });
-            csv.read(source.path);
+            },profile.enabled());
+            CsvInput::Stats csv_stats;
+            {auto timer=profile.scope(Stage::source_read);csv_stats=csv.read(source.path);}
+            profile.add(Stage::csv_parse_build,std::chrono::nanoseconds(csv_stats.parse_ns));
+            profile.count(Counter::csv_rows,csv_stats.lines?csv_stats.lines-1:0);
+            profile.count(Counter::csv_compressed_bytes,csv_stats.compressed);
+            profile.count(Counter::csv_bytes,csv_stats.uncompressed);
             if (header.positions.empty()) throw std::runtime_error("缺少 CSV 表头："+source.path.string());
             const auto ymd=std::to_string(source.day);
             bool changed=false;
@@ -411,11 +564,18 @@ public:
             std::deque<std::future<Prepared>> pending;
             auto next_schema=group_schema;
             auto collect=[&] {
-                auto prepared=pending.front().get();pending.pop_front();
+                auto prepared=[&] {
+                    auto timer=profile.scope(Stage::encode_wait);
+                    return pending.front().get();
+                }();
+                pending.pop_front();
+                auto timer=profile.scope(Stage::publish_index);
                 const auto sid=symbol_id(prepared.symbol);
                 publish(prepared.table,sid,source.day);
                 merge_schema(next_schema,prepared.table);
                 changed=true;stats.rows+=prepared.table.columns.at("time").size();++stats.blocks;
+                profile.count(Counter::rows,prepared.table.columns.at("time").size());
+                profile.count(Counter::blocks);
             };
             for (auto& [symbol,block]:blocks) {
                 if (!block.columns.empty()) {
@@ -423,8 +583,16 @@ public:
                     publishing.push_back(path);
                     pending.push_back(std::async(jobs==1?std::launch::deferred:std::launch::async,
                         [this,symbol,path,day=source.day,block=std::move(block)]() mutable {
-                            auto table=block.finish(names,day);
-                            write(path,table);
+                            auto table=[&] {
+                                auto timer=profile.scope(Stage::block_finish);
+                                return block.finish(names,day);
+                            }();
+                            auto bytes=[&] {
+                                auto timer=profile.scope(Stage::mkp_encode);
+                                return encode(table);
+                            }();
+                            profile.count(Counter::mkp_bytes,bytes.size());
+                            {auto timer=profile.scope(Stage::mkp_write);write(path,bytes);}
                             return Prepared{symbol,std::move(table)};
                         }));
                     if(pending.size()>=jobs)collect();
@@ -439,9 +607,10 @@ public:
                 Statement file(db,"INSERT INTO __ctp_futures_files__(series_id,period) VALUES(?,?)");
                 file.integer(1,series);file.integer(2,source.day);file.next();
             }
-            db.exec("COMMIT");
+            commit();
             group_schema=std::move(next_schema);
-            if(changed)++stats.imported;else ++stats.skipped;
+            if(changed) {++stats.imported;profile.count(Counter::imported_sources);}
+            else {++stats.skipped;profile.count(Counter::skipped_sources);}
         } catch (...) {
             for (const auto& path:publishing) {
                 std::error_code ec;fs::remove(path,ec);fs::remove(path.string()+".tmp",ec);
@@ -483,7 +652,9 @@ void insert_blob(Statement& insert,int64_t id,const std::vector<uint8_t>& bytes)
     insert.next();
 }
 
-void archive_month(Database& db,const std::string& path,const std::vector<StoredDay>& days) {
+void archive_month(Database& db,Profile& profile,const std::string& path,const std::vector<StoredDay>& days) {
+    auto total=profile.scope(Stage::month_total);
+    profile.count(Counter::month_days,days.size());
     const auto file=volume_file(db,path);
     fs::create_directories(file.parent_path());
     {
@@ -497,11 +668,15 @@ void archive_month(Database& db,const std::string& path,const std::vector<Stored
         Statement update(db,"UPDATE __timefile__ SET volume_id=? WHERE id=? AND volume_id IS NULL");
         for(const auto& day:days) {
             const auto source=db.root/"tick"/day.symbol/(std::to_string(day.period)+".mkp");
-            insert_blob(insert,day.id,file_bytes(source));
+            std::vector<uint8_t> bytes;
+            {auto timer=profile.scope(Stage::month_read);bytes=file_bytes(source);}
+            profile.count(Counter::month_read_bytes,bytes.size());
+            {auto timer=profile.scope(Stage::month_insert);insert_blob(insert,day.id,bytes);}
+            profile.count(Counter::month_write_bytes,bytes.size());
             update.integer(1,volume);update.integer(2,day.id);update.next();sqlite3_reset(update.statement);
             loose.push_back(source);
         }
-        db.exec("COMMIT");
+        {auto timer=profile.scope(Stage::month_commit);db.exec("COMMIT");}
     } catch(...) {
         db.exec("ROLLBACK");
         db.exec("DETACH DATABASE ctp_volume");
@@ -527,7 +702,9 @@ public:
     }
 };
 
-void archive_year(Database& index,const std::string& path,const std::vector<StoredDay>& days) {
+void archive_year(Database& index,Profile& profile,const std::string& path,const std::vector<StoredDay>& days) {
+    auto total=profile.scope(Stage::year_total);
+    profile.count(Counter::year_days,days.size());
     const auto destination=volume_file(index,path),temporary=fs::path(destination.string()+".tmp");
     fs::create_directories(destination.parent_path());
     fs::remove(temporary);
@@ -536,8 +713,14 @@ void archive_year(Database& index,const std::string& path,const std::vector<Stor
         output.exec("PRAGMA journal_mode=DELETE;BEGIN;CREATE TABLE blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
         Statement insert(output,"INSERT INTO blob(id,bytes) VALUES(?,?)");
         VolumeBytes source(index);
-        for(const auto& day:days)insert_blob(insert,day.id,source.read(day.path,day.id));
-        output.exec("COMMIT");
+        for(const auto& day:days) {
+            std::vector<uint8_t> bytes;
+            {auto timer=profile.scope(Stage::year_read);bytes=source.read(day.path,day.id);}
+            profile.count(Counter::year_read_bytes,bytes.size());
+            {auto timer=profile.scope(Stage::year_insert);insert_blob(insert,day.id,bytes);}
+            profile.count(Counter::year_write_bytes,bytes.size());
+        }
+        {auto timer=profile.scope(Stage::year_commit);output.exec("COMMIT");}
     }
     fs::remove(destination);
     fs::rename(temporary,destination);
@@ -564,10 +747,11 @@ void archive_year(Database& index,const std::string& path,const std::vector<Stor
     }
 }
 
-void compact_volumes(Database& db,const Catalog& catalog,int today) {
+void compact_volumes(Database& db,Profile& profile,const Catalog& catalog,int today) {
     const auto group=storage::group_id(db,"tick");
     std::map<std::pair<std::string,int>,std::vector<StoredDay>> months;
     {
+        auto timer=profile.scope(Stage::archive_scan);
         Statement q(db,"SELECT f.id,s.name,f.period FROM __timefile__ f JOIN __symbols__ s ON s.id=f.symbol_id "
                 "WHERE f.group_id=? AND f.volume_id IS NULL ORDER BY s.name,f.period");q.integer(1,group);
         while(q.next()) {
@@ -578,11 +762,12 @@ void compact_volumes(Database& db,const Catalog& catalog,int today) {
     }
     for(const auto& [key,days]:months) {
         const auto& [symbol,month]=key;
-        archive_month(db,(fs::path("tick")/symbol/(std::to_string(month)+".data")).string(),days);
+        archive_month(db,profile,(fs::path("tick")/symbol/(std::to_string(month)+".data")).string(),days);
     }
 
     std::map<std::pair<std::string,int>,std::vector<StoredDay>> years;
     {
+        auto timer=profile.scope(Stage::archive_scan);
         Statement q(db,"SELECT f.id,f.volume_id,s.name,f.period,v.path FROM __timefile__ f "
                 "JOIN __symbols__ s ON s.id=f.symbol_id JOIN __volumes__ v ON v.id=f.volume_id "
                 "WHERE f.group_id=? ORDER BY s.name,f.period");q.integer(1,group);
@@ -596,7 +781,7 @@ void compact_volumes(Database& db,const Catalog& catalog,int today) {
         const auto& [symbol,year]=key;
         const auto path=(fs::path("tick")/symbol/(std::to_string(year)+".data")).string();
         if(std::all_of(days.begin(),days.end(),[&](const auto& day){return day.path==path;}))continue;
-        archive_year(db,path,days);
+        archive_year(db,profile,path,days);
     }
 }
 
@@ -628,7 +813,7 @@ std::vector<Source> discover(const std::vector<fs::path>& roots,int start,int en
 }
 }
 
-Json import_ticks(const Options& options) {
+static Json import_ticks_impl(const Options& options,Profile& profile) {
     if(!options.jobs)throw std::runtime_error("并行任务数必须大于零");
     const int start=options.start.empty()?0:date_number(options.start);
     const int end=options.end.empty()?INT_MAX:date_number(options.end);
@@ -645,10 +830,14 @@ Json import_ticks(const Options& options) {
     for (const auto& symbol:options.symbols) symbols.insert(upper(symbol));
     std::set<std::string> products;
     for (const auto& symbol:symbols) products.insert(symbol.substr(0,symbol.find_first_of("0123456789")));
-    auto files=discover(roots,start,end,products);
-    Catalog catalog(roots);
+    std::vector<Source> files;
+    {auto timer=profile.scope(Stage::discover);files=discover(roots,start,end,products);}
+    std::unique_ptr<Catalog> catalog;
+    {auto timer=profile.scope(Stage::catalog);catalog=std::make_unique<Catalog>(roots);}
     fs::create_directories(options.root);
-    Database db(options.root,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
+    std::unique_ptr<Database> database;
+    {auto timer=profile.scope(Stage::index_open);database=std::make_unique<Database>(options.root,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);}
+    auto& db=*database;
     {
         Statement check(db,"PRAGMA application_id");check.next();
         if (check.integer(0)==0x4d4b5450) throw std::runtime_error("不能导入到已打包数据集");
@@ -657,13 +846,26 @@ Json import_ticks(const Options& options) {
     storage::create_index(db);
     db.exec("CREATE TABLE IF NOT EXISTS __ctp_futures_series__(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL);"
             "CREATE TABLE IF NOT EXISTS __ctp_futures_files__(series_id INTEGER,period INTEGER,PRIMARY KEY(series_id,period)) WITHOUT ROWID;");
-    Sources sources(db,symbols,options.jobs);
+    Sources sources(db,profile,symbols,options.jobs);
     db.exec("COMMIT");
     Stats stats;
-    for (const auto& file:files) sources.import(file,catalog,stats);
+    profile.count(Counter::source_files,files.size());
+    for (const auto& file:files) sources.import(file,*catalog,stats);
     auto today=std::chrono::year_month_day{std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now()+std::chrono::hours(8))};
-    compact_volumes(db,catalog,int(today.year())*10000+int(unsigned(today.month()))*100+int(unsigned(today.day())));
+    compact_volumes(db,profile,*catalog,int(today.year())*10000+int(unsigned(today.month()))*100+int(unsigned(today.day())));
     db.exec("PRAGMA journal_mode=DELETE");
     return {{"imported",stats.imported},{"skipped",stats.skipped},{"blocks",stats.blocks},{"rows",stats.rows}};
+}
+
+Json import_ticks(const Options& options) {
+    Profile profile(options.profile,options.jobs);
+    try {
+        auto result=import_ticks_impl(options,profile);
+        profile.finish("ok");
+        return result;
+    } catch(const std::exception& error) {
+        profile.finish("error",error.what());
+        throw;
+    }
 }
 }

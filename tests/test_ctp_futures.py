@@ -137,7 +137,12 @@ def test_completed_months_use_separate_volumes(tmp_path):
         path = mirror/f'nfs_rq/tick/future/2026/FUTURE_TICK_AP_{day}.csv.zip'
         row = tick('CZCE', 'AP701', 1788195600000+(day%100)*1000, '6600', day%100)
         archive(path, list(row), [row])
-    assert cli(root, 'ctp-futures', 'import', mirror)['blocks'] == 2
+    profile = tmp_path/'profile.json'
+    assert cli(root, 'ctp-futures', 'import', mirror, '--profile', profile)['blocks'] == 2
+    measured = json.loads(profile.read_text())
+    assert measured['status'] == 'ok'
+    assert measured['counters']['blocks'] == 2
+    assert measured['stages']['mkp_encode']['calls'] == 2
     with sqlite3.connect(root/'mkt.sqlite') as db:
         assert db.execute('SELECT period FROM __timefile__ ORDER BY period').fetchall() == [(20260901,), (20261008,)]
         assert db.execute('SELECT path FROM __volumes__ ORDER BY path').fetchall() == [
