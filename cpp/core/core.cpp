@@ -383,6 +383,7 @@ void write(const std::filesystem::path& path, const std::vector<uint8_t>& bytes)
         output.write((char*)bytes.data(),bytes.size());
         check(bool(output),"写入失败");
     }
+    std::filesystem::remove(path);
     std::filesystem::rename(temporary,path);
 }
 
