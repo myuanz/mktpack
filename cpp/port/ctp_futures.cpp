@@ -526,6 +526,7 @@ public:
             std::map<std::string,DayBlock,std::less<>> blocks;
             // 输入的行缓冲复用，缓存合约标识时持有字符串。
             std::map<std::pair<std::string,std::string>,DayBlock*> by_id;
+            auto alias=by_id.end();
             CsvInput csv([&](const Row& row){
                 if (header.positions.empty()) {
                     header.set(row);
@@ -535,19 +536,23 @@ public:
                         positions.push_back(field.name=="trading_day"?0:header.at(field.name=="time"?"trade_timestamp":field.name));
                     return;
                 }
-                auto key=std::make_pair(std::string(row.at(exchange)),std::string(row.at(instrument)));
-                auto alias=by_id.find(key);
-                if (alias==by_id.end()) {
-                    auto item=catalog.resolve(key.first,key.second,uid<row.size()?row[uid]:View{},source.day);
-                    if (item.name.empty() || item.name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")!=std::string::npos)
-                        throw std::runtime_error("无效合约代码："+item.name);
-                    auto [it,fresh]=blocks.try_emplace(item.name);
-                    if (fresh) {
-                        it->second.contract=item;
-                        if ((wanted.empty() || wanted.contains(item.name)) && !existing.contains(item.name))
-                            it->second.columns.resize(names.size());
+                const auto exchange_name=row.at(exchange),instrument_name=row.at(instrument);
+                if(alias==by_id.end() || alias->first.first!=exchange_name || alias->first.second!=instrument_name) {
+                    auto key=std::make_pair(std::string(exchange_name),std::string(instrument_name));
+                    alias=by_id.find(key);
+                    if (alias==by_id.end()) {
+                        auto item=catalog.resolve(key.first,key.second,uid<row.size()?row[uid]:View{},source.day);
+                        if (item.name.empty() || item.name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")!=std::string::npos)
+                            throw std::runtime_error("无效合约代码："+item.name);
+                        auto [it,fresh]=blocks.try_emplace(item.name);
+                        if (fresh) {
+                            it->second.contract=item;
+                            if ((wanted.empty() || wanted.contains(item.name)) &&
+                                !existing.contains(item.name))
+                                it->second.columns.resize(names.size());
+                        }
+                        alias=by_id.emplace(std::move(key),&it->second).first;
                     }
-                    alias=by_id.emplace(std::move(key),&it->second).first;
                 }
                 if (!alias->second->columns.empty()) alias->second->append(row,names,positions,source.day);
             },profile.enabled());
