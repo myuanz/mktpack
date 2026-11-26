@@ -124,7 +124,7 @@ def test_completed_source_remains_after_later_failure(tmp_path):
     archive(good_path, list(good), [good])
     archive(bad_path, list(bad), [dict(bad, bid_volume1='bad')])
     with pytest.raises(subprocess.CalledProcessError):
-        cli(root, 'ctp-futures', 'import', mirror)
+        cli(root, 'ctp-futures', 'import', mirror, '--readers', '2')
     with sqlite3.connect(root/'mkt.sqlite') as db:
         assert db.execute('SELECT count(*) FROM __timefile__').fetchone()[0] == 1
         assert db.execute('SELECT count(*) FROM __ctp_futures_files__').fetchone()[0] == 1
@@ -160,7 +160,7 @@ def test_ignore_f_packages_and_keep_first_daily_block(tmp_path):
     for key in ('L', 'PP'):
         path = mirror/'nfs_rq_new'/relative/f'FUTURE_TICK_DCE_{key}_F_20251029.csv.zip'
         archive(path, list(row), [dict(row, bid_volume1='bad')])
-    assert cli(root, 'ctp-futures', 'import', mirror, '--jobs', '4') == {
+    assert cli(root, 'ctp-futures', 'import', mirror, '--jobs', '4', '--readers', '2') == {
         'imported': 1, 'skipped': 1, 'blocks': 1, 'rows': 1,
     }
     assert mktpack.open(root)['tick'].read(symbol='L2602F', columns=['volume'])['volume'].to_pylist() == [4]
@@ -204,6 +204,7 @@ def test_completed_months_use_separate_volumes(tmp_path):
     measured = json.loads(profile.read_text())
     assert measured['status'] == 'ok'
     assert measured['counters']['blocks'] == 2
+    assert measured['stages']['zip_read']['calls'] == measured['stages']['zip_decode']['calls'] == 2
     assert measured['stages']['mkp_encode']['calls'] == 2
     assert measured['counters']['bulk_days'] == 2
     assert 'mkp_write' not in measured['stages']

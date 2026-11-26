@@ -47,7 +47,8 @@ int main(int argc, char** argv) {
     import_ticks->add_option("--start",ctp_options.start,"起始交易日（含）");
     import_ticks->add_option("--end",ctp_options.end,"结束交易日（不含）");
     import_ticks->add_option("--symbols",ctp_options.symbols,"标准合约代码")->expected(-1);
-    import_ticks->add_option("--jobs",ctp_options.jobs,"并行源包任务数（默认 16）")->check(CLI::PositiveNumber);
+    import_ticks->add_option("--jobs",ctp_options.jobs,"解压与编码线程数（默认 16）")->check(CLI::PositiveNumber);
+    import_ticks->add_option("--readers",ctp_options.readers,"ZIP 读取线程数（默认 1）")->check(CLI::PositiveNumber);
     import_ticks->add_option("--profile",ctp_options.profile,"写入分阶段性能记录 JSON");
     auto packing=app.add_subcommand("package","打包为 SQLite 载荷分卷");
     std::string destination, maximum="128MiB", package_start, package_end;

@@ -33,27 +33,29 @@ using View=std::string_view;
 using Row=std::vector<View>;
 
 enum class Stage:size_t {
-    discover,catalog,index_open,source_total,source_index,source_read,csv_parse_build,
+    discover,catalog,index_open,source_prepare,source_index,zip_read,zip_decode,csv_parse_build,
+    read_wait,zip_queue_wait,decode_wait,
     block_finish,mkp_encode,mkp_write,source_wait,publish_index,source_commit,
     archive_scan,month_total,month_read,month_insert,month_commit,
     year_total,year_read,year_insert,year_commit,bulk_total,bulk_commit,count
 };
 
 constexpr std::array stage_names={
-    "discover","catalog","index_open","source_total","source_index","source_read","csv_parse_build",
+    "discover","catalog","index_open","source_prepare","source_index","zip_read","zip_decode","csv_parse_build",
+    "read_wait","zip_queue_wait","decode_wait",
     "block_finish","mkp_encode","mkp_write","source_wait","publish_index","source_commit",
     "archive_scan","month_total","month_read","month_insert","month_commit",
     "year_total","year_read","year_insert","year_commit","bulk_total","bulk_commit"
 };
 
 enum class Counter:size_t {
-    source_files,csv_rows,csv_compressed_bytes,csv_bytes,imported_sources,skipped_sources,
+    source_files,zip_bytes,csv_rows,csv_compressed_bytes,csv_bytes,imported_sources,skipped_sources,
     blocks,rows,mkp_bytes,month_days,month_read_bytes,month_write_bytes,
     year_days,year_read_bytes,year_write_bytes,bulk_days,bulk_bytes,count
 };
 
 constexpr std::array counter_names={
-    "source_files","csv_rows","csv_compressed_bytes","csv_bytes","imported_sources","skipped_sources",
+    "source_files","zip_bytes","csv_rows","csv_compressed_bytes","csv_bytes","imported_sources","skipped_sources",
     "blocks","rows","mkp_bytes","month_days","month_read_bytes","month_write_bytes",
     "year_days","year_read_bytes","year_write_bytes","bulk_days","bulk_bytes"
 };
@@ -100,7 +102,7 @@ public:
         ~Scope() {if(profile)profile->add(stage,Clock::now()-start);}
     };
 
-    Profile(fs::path output,size_t jobs):path(std::move(output)),configuration{{"jobs",jobs},
+    Profile(fs::path output,size_t jobs,size_t readers):path(std::move(output)),configuration{{"jobs",jobs},{"readers",readers},
         {"sqlite_journal","MEMORY"},{"sqlite_synchronous","OFF"},{"sqlite_locking","EXCLUSIVE"}} {}
     bool enabled() const {return !path.empty();}
     Scope scope(Stage stage) {return Scope(enabled()?this:nullptr,stage);}
@@ -200,6 +202,16 @@ void split_row(View line,Row& fields) {
     }
 }
 
+std::vector<uint8_t> file_bytes(const fs::path& path) {
+    std::ifstream input(path,std::ios::binary|std::ios::ate);
+    if(!input)throw std::runtime_error("无法读取："+path.string());
+    std::vector<uint8_t> bytes(size_t(input.tellg()));
+    input.seekg(0);
+    input.read(reinterpret_cast<char*>(bytes.data()),bytes.size());
+    if(!input)throw std::runtime_error("载荷读取失败："+path.string());
+    return bytes;
+}
+
 class CsvInput {
 public:
     struct Stats {uint64_t lines=0,compressed=0,uncompressed=0,parse_ns=0;};
@@ -239,9 +251,9 @@ private:
     }
 public:
     explicit CsvInput(std::function<void(const Row&)> visitor,bool timed=false):visit(std::move(visitor)),measure(timed) {}
-    Stats read(const fs::path& path) {
+    Stats read(const fs::path& path,std::vector<uint8_t> bytes) {
         mz_zip_archive zip{};
-        if (!mz_zip_reader_init_file(&zip,path.string().c_str(),0)) throw std::runtime_error("无法打开 ZIP："+path.string());
+        if (!mz_zip_reader_init_mem(&zip,bytes.data(),bytes.size(),0)) throw std::runtime_error("无法打开 ZIP："+path.string());
         try {
             const auto member=path.stem().string();
             const auto i=mz_zip_reader_locate_file(&zip,member.c_str(),nullptr,MZ_ZIP_FLAG_IGNORE_PATH);
@@ -306,7 +318,7 @@ class Catalog {
                     date_number(std::string(r.at(open))),end});
             expirations[canonical]=std::max(expirations[canonical],end);
         });
-        csv.read(path);
+        csv.read(path,file_bytes(path));
     }
 public:
     explicit Catalog(const std::vector<fs::path>& roots) {
@@ -493,7 +505,16 @@ struct ImportPlan {
 };
 
 class SourceResults {
-    using Task=std::packaged_task<PreparedSource()>;
+    struct Task {
+        const Source* source;
+        std::promise<PreparedSource> result;
+    };
+    struct Loaded {
+        Task task;
+        std::vector<uint8_t> bytes;
+    };
+    static constexpr size_t zip_budget=128*1024*1024;
+
     const Catalog& catalog;
     const std::vector<Field>& names;
     const Symbols& wanted;
@@ -501,15 +522,19 @@ class SourceResults {
     const std::map<int,Symbols>& existing;
     std::span<const Source* const> remaining;
     std::mutex mutex;
-    std::condition_variable_any ready;
+    std::condition_variable_any read_ready,decode_ready,zip_space;
     std::queue<Task> tasks;
+    std::queue<Loaded> loaded;
+    size_t queued_bytes=0;
     std::deque<std::future<PreparedSource>> pending;
     int write_day=0;
     Symbols written;
-    std::vector<std::jthread> workers; // 先结束线程，再销毁任务队列。
+    std::vector<std::jthread> workers,readers; // 先结束线程，再销毁任务队列。
 
-    PreparedSource prepare(const Source& source,const Symbols* existing) {
-        auto source_timer=profile.scope(Stage::source_total);
+    PreparedSource prepare(const Source& source,std::vector<uint8_t> bytes) {
+        auto source_timer=profile.scope(Stage::source_prepare);
+        const auto day=existing.find(source.day);
+        const auto* known=day==existing.end()?nullptr:&day->second;
         Header header;std::vector<size_t> positions;
         size_t exchange=0,instrument=0,uid=0;
         std::map<std::string,DayBlock,std::less<>> blocks;
@@ -536,7 +561,7 @@ class SourceResults {
                     if (fresh) {
                         it->second.contract=item;
                         if ((wanted.empty() || wanted.contains(item.name)) &&
-                            (!existing || !existing->contains(item.name)))
+                            (!known || !known->contains(item.name)))
                             it->second.columns.resize(names.size());
                     }
                     alias=by_id.emplace(std::move(key),&it->second).first;
@@ -546,8 +571,8 @@ class SourceResults {
         },profile.enabled());
         CsvInput::Stats csv_stats;
         {
-            auto timer=profile.scope(Stage::source_read);
-            csv_stats=csv.read(source.path);
+            auto timer=profile.scope(Stage::zip_decode);
+            csv_stats=csv.read(source.path,std::move(bytes));
         }
         profile.add(Stage::csv_parse_build,std::chrono::nanoseconds(csv_stats.parse_ns));
         profile.count(Counter::csv_rows,csv_stats.lines?csv_stats.lines-1:0);
@@ -579,42 +604,89 @@ class SourceResults {
         return prepared;
     }
 
-    void work(std::stop_token stop) {
-        for(;;) {
-            Task task;
-            {
-                std::unique_lock lock(mutex);
-                ready.wait(lock,stop,[&] {return !tasks.empty();});
-                if(stop.stop_requested())return;
-                task=std::move(tasks.front());
-                tasks.pop();
+    void read(std::stop_token stop) {
+        while(!stop.stop_requested()) {
+            std::unique_lock lock(mutex);
+            if(tasks.empty()) {
+                auto timer=profile.scope(Stage::read_wait);
+                read_ready.wait(lock,stop,[&] {return !tasks.empty();});
             }
-            task();
+            if(stop.stop_requested())return;
+            auto task=std::move(tasks.front());
+            tasks.pop();
+            lock.unlock();
+
+            std::vector<uint8_t> bytes;
+            try {
+                auto timer=profile.scope(Stage::zip_read);
+                bytes=file_bytes(task.source->path);
+            } catch(...) {
+                task.result.set_exception(std::current_exception());
+                continue;
+            }
+            profile.count(Counter::zip_bytes,bytes.size());
+
+            lock.lock();
+            const auto fits=[&] {
+                return loaded.empty() || (queued_bytes<=zip_budget && bytes.size()<=zip_budget-queued_bytes);
+            };
+            if(!fits()) {
+                auto timer=profile.scope(Stage::zip_queue_wait);
+                if(!zip_space.wait(lock,stop,fits))return;
+            }
+            if(stop.stop_requested())return;
+            queued_bytes+=bytes.size();
+            loaded.push({std::move(task),std::move(bytes)});
+            lock.unlock();
+            decode_ready.notify_one();
+        }
+    }
+    void decode(std::stop_token stop) {
+        while(!stop.stop_requested()) {
+            std::unique_lock lock(mutex);
+            if(loaded.empty()) {
+                auto timer=profile.scope(Stage::decode_wait);
+                if(!decode_ready.wait(lock,stop,[&] {return !loaded.empty();}))return;
+            }
+            if(stop.stop_requested())return;
+            auto input=std::move(loaded.front());
+            loaded.pop();
+            queued_bytes-=input.bytes.size();
+            lock.unlock();
+            zip_space.notify_all();
+
+            try {
+                input.task.result.set_value(prepare(*input.task.source,std::move(input.bytes)));
+            } catch(...) {
+                input.task.result.set_exception(std::current_exception());
+            }
         }
     }
     void schedule() {
         if(remaining.empty())return;
-        const auto* source=remaining.front();
+        Task task{remaining.front(),{}};
         remaining=remaining.subspan(1);
-        const auto day=existing.find(source->day);
-        const auto* known=day==existing.end()?nullptr:&day->second;
-        Task task([this,source,known] {return prepare(*source,known);});
-        pending.push_back(task.get_future());
+        pending.push_back(task.result.get_future());
         {
             std::lock_guard lock(mutex);
             tasks.push(std::move(task));
         }
-        ready.notify_one();
+        read_ready.notify_one();
     }
 public:
     SourceResults(const ImportPlan& plan,const Catalog& contracts,const std::vector<Field>& fields,
-                  const Symbols& requested,Profile& profiler,size_t jobs)
+                  const Symbols& requested,Profile& profiler,size_t jobs,size_t read_jobs)
         :catalog(contracts),names(fields),wanted(requested),profile(profiler),
          existing(plan.existing),remaining(plan.sources) {
         const auto count=std::min(jobs,remaining.size());
+        const auto reader_count=std::min(read_jobs,remaining.size());
+        // 有序写入等待慢包时，后面的包仍可读取和处理。
+        const auto window=std::min(remaining.size(),4*std::max(count,reader_count));
         workers.reserve(count);
-        for(size_t i=0;i<count;++i)workers.emplace_back([this](std::stop_token stop) {work(stop);});
-        for(size_t i=0;i<count;++i)schedule();
+        readers.reserve(reader_count);
+        for(size_t i=0;i<count;++i)workers.emplace_back([this](std::stop_token stop) {decode(stop);});
+        for(size_t i=0;i<reader_count;++i)readers.emplace_back([this](std::stop_token stop) {read(stop);});
+        for(size_t i=0;i<window;++i)schedule();
     }
     PreparedSource take() {
         auto prepared=[&] {
@@ -828,16 +900,6 @@ struct StoredDay {int64_t id,volume;std::string symbol,path;int period;};
 
 fs::path volume_file(const Database& db,const std::string& path) {
     return db.root/fs::path(path);
-}
-
-std::vector<uint8_t> file_bytes(const fs::path& path) {
-    std::ifstream input(path,std::ios::binary|std::ios::ate);
-    if(!input)throw std::runtime_error("无法读取："+path.string());
-    std::vector<uint8_t> bytes(size_t(input.tellg()));
-    input.seekg(0);
-    input.read(reinterpret_cast<char*>(bytes.data()),bytes.size());
-    if(!input)throw std::runtime_error("载荷读取失败："+path.string());
-    return bytes;
 }
 
 int64_t volume_id(Database& db,const std::string& path) {
@@ -1074,6 +1136,7 @@ std::vector<Source> discover(const std::vector<fs::path>& roots,int start,int en
 
 static Json import_ticks_impl(const Options& options,Profile& profile) {
     if(!options.jobs)throw std::runtime_error("并行任务数必须大于零");
+    if(!options.readers)throw std::runtime_error("读取线程数必须大于零");
     const int start=options.start.empty()?0:date_number(options.start);
     const int end=options.end.empty()?INT_MAX:date_number(options.end);
     if (start>=end) throw std::runtime_error("需要 start < end");
@@ -1115,7 +1178,7 @@ static Json import_ticks_impl(const Options& options,Profile& profile) {
     profile.count(Counter::source_files,files.size());
     const auto plan=writer.plan(files);
     {
-        SourceResults results(plan,*catalog,names,symbols,profile,options.jobs);
+        SourceResults results(plan,*catalog,names,symbols,profile,options.jobs,options.readers);
         write_import(writer,plan,results,*catalog,today);
     }
     if(!plan.backfill)compact_volumes(db,profile,*catalog,today);
@@ -1123,7 +1186,7 @@ static Json import_ticks_impl(const Options& options,Profile& profile) {
 }
 
 Json import_ticks(const Options& options) {
-    Profile profile(options.profile,options.jobs);
+    Profile profile(options.profile,options.jobs,options.readers);
     try {
         auto result=import_ticks_impl(options,profile);
         profile.finish("ok");
