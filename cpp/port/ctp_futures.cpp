@@ -95,7 +95,7 @@ public:
     };
 
     Profile(fs::path output,size_t jobs):path(std::move(output)),configuration{{"jobs",jobs},
-        {"sqlite_journal","PERSIST"}} {}
+        {"sqlite_journal","MEMORY"},{"sqlite_synchronous","OFF"},{"sqlite_locking","EXCLUSIVE"}} {}
     bool enabled() const {return !path.empty();}
     Scope scope(Stage stage) {return Scope(enabled()?this:nullptr,stage);}
     void add(Stage stage,Clock::duration duration) {
@@ -440,6 +440,16 @@ struct DayBlock {
 struct Source {fs::path path;std::string series;int day;};
 struct Stats {int64_t imported=0,skipped=0,blocks=0,rows=0;};
 
+void attach_volume(Database& db,const std::string& path) {
+    const auto file=db.root/fs::path(path);
+    fs::create_directories(file.parent_path());
+    {
+        Statement attach(db,"ATTACH DATABASE ? AS ctp_volume");
+        attach.text(1,file.string());attach.next();
+    }
+    db.exec("PRAGMA ctp_volume.journal_mode=MEMORY;PRAGMA ctp_volume.synchronous=OFF;PRAGMA ctp_volume.locking_mode=EXCLUSIVE");
+}
+
 class Sources {
     Database& db;
     Profile& profile;
@@ -660,14 +670,12 @@ void insert_blob(Statement& insert,int64_t id,const std::vector<uint8_t>& bytes)
 void archive_month(Database& db,Profile& profile,const std::string& path,const std::vector<StoredDay>& days) {
     auto total=profile.scope(Stage::month_total);
     profile.count(Counter::month_days,days.size());
-    const auto file=volume_file(db,path);
-    fs::create_directories(file.parent_path());
-    {
-        Statement attach(db,"ATTACH DATABASE ? AS ctp_volume");attach.text(1,file.string());attach.next();
-    }
+    attach_volume(db,path);
     std::vector<fs::path> loose;
+    bool transaction=false;
     try {
-        db.exec("BEGIN IMMEDIATE;CREATE TABLE IF NOT EXISTS ctp_volume.blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
+        db.exec("BEGIN IMMEDIATE");transaction=true;
+        db.exec("CREATE TABLE IF NOT EXISTS ctp_volume.blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
         Statement insert(db,"INSERT INTO ctp_volume.blob(id,bytes) VALUES(?,?)");
         const auto volume=volume_id(db,path);
         Statement update(db,"UPDATE __timefile__ SET volume_id=? WHERE id=? AND volume_id IS NULL");
@@ -681,9 +689,9 @@ void archive_month(Database& db,Profile& profile,const std::string& path,const s
             update.integer(1,volume);update.integer(2,day.id);update.next();sqlite3_reset(update.statement);
             loose.push_back(source);
         }
-        {auto timer=profile.scope(Stage::month_commit);db.exec("COMMIT");}
+        {auto timer=profile.scope(Stage::month_commit);db.exec("COMMIT");transaction=false;}
     } catch(...) {
-        db.exec("ROLLBACK");
+        if(transaction)db.exec("ROLLBACK");
         db.exec("DETACH DATABASE ctp_volume");
         throw;
     }
@@ -715,7 +723,7 @@ void archive_year(Database& index,Profile& profile,const std::string& path,const
     fs::remove(temporary);
     {
         Database output(temporary,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
-        output.exec("PRAGMA journal_mode=DELETE;BEGIN;CREATE TABLE blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
+        output.exec("PRAGMA journal_mode=MEMORY;PRAGMA synchronous=OFF;PRAGMA locking_mode=EXCLUSIVE;BEGIN;CREATE TABLE blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)");
         Statement insert(output,"INSERT INTO blob(id,bytes) VALUES(?,?)");
         VolumeBytes source(index);
         for(const auto& day:days) {
@@ -865,7 +873,7 @@ static Json import_ticks_impl(const Options& options,Profile& profile) {
         Statement check(db,"PRAGMA application_id");check.next();
         if (check.integer(0)==0x4d4b5450) throw std::runtime_error("不能导入到已打包数据集");
     }
-    db.exec("PRAGMA journal_mode=PERSIST;BEGIN IMMEDIATE");
+    db.exec("PRAGMA journal_mode=MEMORY;PRAGMA synchronous=OFF;PRAGMA locking_mode=EXCLUSIVE;BEGIN EXCLUSIVE");
     storage::create_index(db);
     db.exec("CREATE TABLE IF NOT EXISTS __ctp_futures_series__(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL);"
             "CREATE TABLE IF NOT EXISTS __ctp_futures_files__(series_id INTEGER,period INTEGER,PRIMARY KEY(series_id,period)) WITHOUT ROWID;");
@@ -876,7 +884,6 @@ static Json import_ticks_impl(const Options& options,Profile& profile) {
     for (const auto& file:files) sources.import(file,*catalog,stats);
     auto today=std::chrono::year_month_day{std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now()+std::chrono::hours(8))};
     compact_volumes(db,profile,*catalog,int(today.year())*10000+int(unsigned(today.month()))*100+int(unsigned(today.day())));
-    db.exec("PRAGMA journal_mode=DELETE");
     return {{"imported",stats.imported},{"skipped",stats.skipped},{"blocks",stats.blocks},{"rows",stats.rows}};
 }
 

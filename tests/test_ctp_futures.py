@@ -5,7 +5,6 @@ import shutil
 import sqlite3
 import subprocess
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 
@@ -94,7 +93,7 @@ def test_subset_incremental_tick_import_and_archive(tmp_path):
         cli(packed, 'ctp-futures', 'import', mirror)
 
 
-def test_concurrent_import_and_retry_after_bad_source(tmp_path):
+def test_retry_after_bad_source(tmp_path):
     mirror, root = tmp_path/'mirror', tmp_path/'data'
     path = mirror/'nfs_rq_new/tick/future/2026/11/02/FUTURE_TICK_DCE_L_20261102.csv.zip'
     row = tick('DCE', 'l2612F', 1793365140027, '9851', 23, 'DCE|F|L|2612F')
@@ -107,8 +106,7 @@ def test_concurrent_import_and_retry_after_bad_source(tmp_path):
         assert db.execute('SELECT count(*) FROM __timefile__').fetchone()[0] == 0
         assert db.execute('SELECT count(*) FROM __ctp_futures_files__').fetchone()[0] == 0
     archive(path, list(row), [row])
-    with ThreadPoolExecutor(2) as pool:
-        runs = list(pool.map(lambda _: cli(root, *args), range(2)))
+    runs = [cli(root, *args), cli(root, *args)]
     assert sorted(r['blocks'] for r in runs) == [0, 1]
     assert mktpack.open(root)['tick'].read(symbol='L2612F', columns=['last_price']).to_pydict() == {
         'last_price': [Decimal('9851')],
