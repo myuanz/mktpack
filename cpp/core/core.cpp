@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <numeric>
 #include <set>
 namespace mktpack {
@@ -13,8 +14,11 @@ int64_t checked(__int128 v) { check(v>=INT64_MIN&&v<=INT64_MAX,"整数溢出"); 
 uint64_t zz(int64_t x) { return (uint64_t(x)<<1)^(x<0?UINT64_MAX:0); }
 int64_t unzz(uint64_t x) { return std::bit_cast<int64_t>((x>>1)^(uint64_t(0)-(x&1))); }
 Bytes compress(const Bytes& input) {
+    struct FreeContext {void operator()(ZSTD_CCtx* context) const {ZSTD_freeCCtx(context);}};
+    thread_local std::unique_ptr<ZSTD_CCtx,FreeContext> context(ZSTD_createCCtx());
+    check(bool(context),"无法创建压缩上下文");
     Bytes output(ZSTD_compressBound(input.size()));
-    const auto size=ZSTD_compress(output.data(),output.size(),input.data(),input.size(),9);
+    const auto size=ZSTD_compressCCtx(context.get(),output.data(),output.size(),input.data(),input.size(),9);
     check(!ZSTD_isError(size),"压缩失败");
     output.resize(size);
     return output;
