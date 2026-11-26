@@ -1,59 +1,81 @@
 # MktPack
 
-精确保存金融时序数据的 C++20 库，提供 Python Arrow 接口和原生 `mkt` 命令。当前支持基础 `.mkp` 格式、数据集查询，以及
+精确保存金融时序数据的 C++20 库，提供 Python 接口和原生 `mkt` 命令。除了 `.mkp` 基础市场时序压缩格式，还提供两个适配: 
 
 - 币安 USDT UM 永续 Kline、OI、结算资金费率和交易所信息下载
-- 国内期货 tick 导入。
+- 中国期货 tick 导入
+
+## 安装
+
+```sh
+uv add mktpack
+```
+
+需要 Python 3.12+。wheel 包含原生 `mkt` 命令。
+
+## Python 读取接口
+
+```python
+import mktpack
+
+market = mktpack.open('data/binance') # TODO 添加检查所有可用数据的接口
+bars = market['kline'].read(
+    symbol='BTCUSDT', start=20260101, end=20260201,
+    columns=['time', 'close', 'volume'],
+)
+info = market['exchangeinfo']
+
+futures = mktpack.open('data/cn_futures')
+ticks = futures['tick'].read(symbol='CU2610', columns=['time', 'last_price'])
+```
+
+时序查询返回 Arrow Table，时间按 UTC `[start,end)` 筛选
+
+## 币安下载
+
+```sh
+uv run mkt --root data/binance binance download --symbols BTCUSDT --start 2026-01-01 --end 2026-02-01
+```
+
+省略 `--symbols` 自动发现全部 USDT 品种。
+
+币安下载默认将主动买量占比按 0.1 个百分点量化，添加 `--no-lossy-taker` 使用无损编码。`--full` 检查来源对应的本地载荷并补齐缺失数据。
+
+TODO: 交换默认量化
+
+## 导入中国期货 tick
+
+```sh
+uv run mkt --root data/cn_futures ctp-futures import path/to/ctp-mirror --symbols CU2610 --start 2026-09-01 --end 2026-10-01
+```
+
+镜像根目录包含 `nfs_rq*/tick/future`，导入按源包文件名中的交易日筛选，不写 symbols、start、end 时默认全量
+
+## 打包
+
+工具提供将零散的数据文件打包到若干个大文件的功能: 
+
+```sh
+uv run mkt --root data/binance package packaged-data --max-file-size 8GiB
+```
+
+可用 `--groups`、`--symbols`、`--start`、`--end` 筛选. 
+
+普通数据目录和打包目录使用相同的读取接口。
 
 ## 开发
 
 ```sh
 uv sync
-just build
 just test
 ```
 
-## 下载与读取
+## LLM 与 MktPack
 
-```sh
-build/cli/mkt --root data/binance binance download \
-  --symbols BTCUSDT DOGEUSDT ETHUSDT BNBUSDT \
-  --start 2024-01-01 --end 2026-10-22 \
-  --source-cache validation/source/binance --jobs 4
-build/cli/mkt --root data/binance binance check
-```
+我完成了需求和规范的整理，LLM 完成了主要代码，我负责了审查和编写部分核心代码. 
 
-```python
-import mktpack
+库已经在实际项目投入使用
 
-market = mktpack.open('data/binance')
-table = market['kline'].read(
-    symbol='BTCUSDT', start=20261021, end=20261022,
-    columns=['time', 'close', 'volume', 'taker_buy_volume'],
-)
-info: dict = market['exchangeinfo']
-```
-
-省略 `--symbols` 自动发现全部 USDT 品种。
-
-时间范围为 UTC `[start,end)`，定点数返回 Arrow decimal。币安下载默认将主动买量占比按 0.1 个百分点量化，添加 `--no-lossy-taker` 使用无损编码。`--full` 检查来源对应的本地载荷并补齐缺失数据。
-
-## 导入国内期货 tick
-
-```sh
-mkt --root data/cn_futures ctp-futures import /mnt/d/ctp-mirror --symbols CU2610 --start 2026-09-01 --end 2026-10-01
-```
-
-导入日期按源包交易日筛选，可用 `mkt --root data/cn_futures ctp-futures check` 检查数据集。读取使用 `mktpack.open('data/cn_futures')['tick'].read(symbol='CU2610')`，可用 `columns` 指定所需列。
-
-## 打包
-
-```sh
-build/cli/mkt --root data/binance package packaged-data --max-file-size 128MiB --jobs 4
-```
-
-可用 `--groups`、`--symbols`、`--start`、`--end` 筛选；普通表及其外置数据库完整保留。单个币安年度 MKP、期货 tick 合约月或整月 SQLite 时序数据放不下时需调大分卷上限。
-
-所有接受普通数据目录的地方都接受打包结果
+---
 
 [需求](docs/需求.md) · [格式规范](docs/规范.md)

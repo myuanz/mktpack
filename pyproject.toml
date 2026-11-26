@@ -5,6 +5,9 @@ build-backend = "scikit_build_core.build"
 name = "mktpack"
 version = "0.1.0"
 description = "精确金融时序数据格式与读写库"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "licenses/*"]
 requires-python = ">=3.12"
 dependencies = ["pyarrow>=20", "numpy>=2"]
 [dependency-groups]
