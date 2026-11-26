@@ -96,7 +96,7 @@ def test_subset_incremental_tick_import_and_archive(tmp_path):
 
 def test_concurrent_import_and_retry_after_bad_source(tmp_path):
     mirror, root = tmp_path/'mirror', tmp_path/'data'
-    path = mirror/'nfs_rq_new/tick/future/2026/11/02/FUTURE_TICK_DCE_L_F_20261102.csv.zip'
+    path = mirror/'nfs_rq_new/tick/future/2026/11/02/FUTURE_TICK_DCE_L_20261102.csv.zip'
     row = tick('DCE', 'l2612F', 1793365140027, '9851', 23, 'DCE|F|L|2612F')
     bad = dict(row, bid_volume1='bad')
     archive(path, list(row), [row, bad])
@@ -121,7 +121,7 @@ def test_mirror_suffix_independent_of_filename_format(tmp_path):
     directory = mirror/'nfs_rq_archive/tick/future/2026/11/02'
     rows = [
         ('FUTURE_TICK_AP_20261102.csv.zip', tick('CZCE', 'AP701', 1793581200000, '6600', 3)),
-        ('FUTURE_TICK_DCE_L_F_20261102.csv.zip', tick('DCE', 'l2612F', 1793581200000, '9851', 4, 'DCE|F|L|2612F')),
+        ('FUTURE_TICK_DCE_L_20261102.csv.zip', tick('DCE', 'l2612F', 1793581200000, '9851', 4, 'DCE|F|L|2612F')),
     ]
     for filename, row in rows:
         archive(directory/filename, list(row), [row])
@@ -129,6 +129,22 @@ def test_mirror_suffix_independent_of_filename_format(tmp_path):
     assert cli(root, *args)['blocks'] == 2
     assert cli(root, *args)['skipped'] == 2
     assert sorted(mktpack.open(root)['tick'].read(columns=['symbol'])['symbol'].to_pylist()) == ['AP2701', 'L2612F']
+
+
+def test_ignore_f_packages_and_keep_first_daily_block(tmp_path):
+    mirror, root = tmp_path/'mirror', tmp_path/'data'
+    relative = Path('tick/future/2025/10/29')
+    row = tick('DCE', 'l2602F', 1761700000000, '9851', 4, 'DCE|F|L|2602F')
+    filename = 'FUTURE_TICK_DCE_L_20251029.csv.zip'
+    archive(mirror/'nfs_rq'/relative/filename, list(row), [row])
+    archive(mirror/'nfs_rq_new'/relative/filename, list(row), [dict(row, volume=5)])
+    for key in ('L', 'PP'):
+        path = mirror/'nfs_rq_new'/relative/f'FUTURE_TICK_DCE_{key}_F_20251029.csv.zip'
+        archive(path, list(row), [dict(row, bid_volume1='bad')])
+    assert cli(root, 'ctp-futures', 'import', mirror, '--jobs', '4') == {
+        'imported': 1, 'skipped': 1, 'blocks': 1, 'rows': 1,
+    }
+    assert mktpack.open(root)['tick'].read(symbol='L2602F', columns=['volume'])['volume'].to_pylist() == [4]
 
 
 def test_bounded_discovery_only_visits_requested_date_directories(tmp_path):

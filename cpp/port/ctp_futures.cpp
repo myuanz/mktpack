@@ -800,6 +800,7 @@ std::vector<Source> discover(const std::vector<fs::path>& roots,int start,int en
             auto pos=name.rfind('_');
             constexpr View prefix="FUTURE_TICK_";
             auto key=View(name).substr(prefix.size(),pos-prefix.size());
+            if(key.ends_with("_F"))return;
             if (!products.empty()) {
                 // 旧文件以品种开头，新文件先写交易所；行内再按完整合约名筛选。
                 auto split=key.find('_');
