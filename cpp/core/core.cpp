@@ -173,6 +173,8 @@ static std::vector<uint8_t> encode_impl(Input&& input) {
         return spec.value("encoding","")=="ratio_1000";
     });
     if (!ohlc && !ratio) {
+        // TODO: 用专用 DSL 统一描述编码、变换及参数，避免每新增一种机制就增加头部字段。
+        header["codec"]="predictive";
         encode_block(std::forward<Input>(input).columns,std::forward<Input>(input).schema,header,payload);
         return assemble(header,payload);
     }
@@ -274,10 +276,7 @@ std::vector<uint8_t> encode(const Table& table) {return encode_impl(table);}
 std::vector<uint8_t> encode(Table&& table) {return encode_impl(std::move(table));}
 static Table decode_selected(const Bytes& bytes,const std::vector<std::string>* requested) {
     auto [description,offset]=header(bytes);
-    const bool predictive=std::any_of(description.at("columns").begin(),description.at("columns").end(),[](const auto& d) {
-        return d.value("codec","")=="predictive";
-    });
-    if (predictive) return decode_block(bytes,description,offset,requested);
+    if (description.value("codec","")=="predictive") return decode_block(bytes,description,offset,requested);
     const size_t rows=description.at("rows");
     Table table;
     table.metadata=description.at("metadata");

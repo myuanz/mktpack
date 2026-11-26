@@ -80,7 +80,9 @@ int main() {
     expect(decode(block,{}).columns.empty(),"空投影错误");
     size_t offset=12;
     for (unsigned i=0;i<4;++i) offset+=size_t(block[8+i])<<(8*i);
+    expect(block_info.at("codec")=="predictive","文件头缺少预测编码标签");
     for (const auto& d:block_info.at("columns")) {
+        expect(!d.contains("codec"),"列描述重复保存预测编码标签");
         if (d.at("name")=="period") expect(d.at("size")==0,"常量不应写入压缩帧");
         if (d.at("name")=="bounds") block[offset]=0;
         offset+=d.at("size").get<size_t>();

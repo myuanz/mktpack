@@ -160,7 +160,6 @@ void encode_block(Columns columns,Json schema,Json& header,std::vector<Bytes>& p
     for (const auto& [name,values]:columns) {
         auto d=schema.at(name);
         d["name"]=name;
-        d["codec"]="predictive";
         d["first"]=values.empty()?0:values[0];
         if (std::adjacent_find(values.begin(),values.end(),std::not_equal_to<>())==values.end()) {
             d["transform"]="constant";
