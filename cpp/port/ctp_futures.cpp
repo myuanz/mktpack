@@ -151,7 +151,7 @@ int64_t integer(View text) {
     int64_t n;
     const auto [end,error]=std::from_chars(text.data(),text.data()+text.size(),n);
     if (error==std::errc{} && end==text.data()+text.size()) return n;
-    auto decimal=decimal_integer(std::string(text));
+    auto decimal=decimal_integer(text);
     if (decimal.decimals) throw std::runtime_error("需要整数："+std::string(text));
     return decimal.value;
 }
@@ -392,9 +392,9 @@ DecimalInteger decimal(View text,bool price) {
         char buf[64];
         auto result=std::to_chars(buf,buf+sizeof buf,number,std::chars_format::general);
         if (result.ec!=std::errc{}) throw std::runtime_error("无法转换价格");
-        return decimal_integer(std::string(buf,result.ptr));
+        return decimal_integer(View(buf,result.ptr));
     }
-    return decimal_integer(std::string(text));
+    return decimal_integer(text);
 }
 
 struct Values {std::vector<int64_t> data;int scale=0;};

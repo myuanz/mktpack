@@ -4,32 +4,44 @@
 #include <stdexcept>
 
 namespace mktpack {
-DecimalInteger decimal_integer(std::string s, int* literal_scale) {
-    bool negative=!s.empty() && s[0]=='-';
-    if(!s.empty() && (s[0]=='-' || s[0]=='+')) s.erase(0,1);
-    auto e=s.find_first_of("eE"); int exponent=0;
-    if(e!=std::string::npos) {
-        auto text=s.substr(e+1);
-        if(!text.empty() && text[0]=='+') text.erase(0,1);
-        auto parsed=std::from_chars(text.data(),text.data()+text.size(),exponent);
-        if(parsed.ec!=std::errc{} || parsed.ptr!=text.data()+text.size()) throw std::runtime_error("十进制指数超出范围或格式错误");
-        s.resize(e);
+DecimalInteger decimal_integer(std::string_view text, int* literal_scale) {
+    const bool negative=!text.empty() && text.front()=='-';
+    if(!text.empty() && (text.front()=='-' || text.front()=='+')) text.remove_prefix(1);
+    const auto e=text.find_first_of("eE");
+    auto mantissa=text.substr(0,e);
+    int exponent=0;
+    if(e!=text.npos) {
+        auto suffix=text.substr(e+1);
+        if(!suffix.empty() && suffix.front()=='+')suffix.remove_prefix(1);
+        const auto parsed=std::from_chars(suffix.data(),suffix.data()+suffix.size(),exponent);
+        if(parsed.ec!=std::errc{} || parsed.ptr!=suffix.data()+suffix.size()) throw std::runtime_error("十进制指数超出范围或格式错误");
     }
-    auto dot=s.find('.'); int64_t decimals=dot==std::string::npos?0:static_cast<int64_t>(s.size()-dot-1);
-    if(dot!=std::string::npos) s.erase(dot,1);
-    if(s.empty() || s.find_first_not_of("0123456789")!=std::string::npos) throw std::runtime_error("数值必须是有限十进制数");
+    const auto dot=mantissa.find('.');
+    int64_t decimals=dot==mantissa.npos?0:static_cast<int64_t>(mantissa.size()-dot-1);
+    bool digit=false;
+    size_t first=mantissa.npos,last=mantissa.npos;
+    for(size_t i=0;i<mantissa.size();++i) {
+        const char c=mantissa[i];
+        if(c=='.' && i==dot)continue;
+        if(c<'0' || c>'9')throw std::runtime_error("数值必须是有限十进制数");
+        digit=true;
+        if(c!='0') {if(first==mantissa.npos)first=i;last=i;}
+    }
+    if(!digit)throw std::runtime_error("数值必须是有限十进制数");
     decimals-=exponent;
     if(literal_scale) {
         if(decimals>std::numeric_limits<int>::max()) throw std::runtime_error("小数位数超出范围");
         *literal_scale=decimals>0?static_cast<int>(decimals):0;
     }
-    auto nonzero=s.find_first_not_of('0');
-    if(nonzero==std::string::npos) return {0,0};
-    s.erase(0,nonzero);
-    while(s.back()=='0') { s.pop_back(); --decimals; }
+    if(first==mantissa.npos) return {0,0};
+    for(size_t i=last+1;i<mantissa.size();++i)if(mantissa[i]!='.')--decimals;
     if(decimals>18 || decimals < -18) throw std::runtime_error("十进制数超出精度或 int64 范围");
-    uint64_t unsigned_value=0; auto parsed=std::from_chars(s.data(),s.data()+s.size(),unsigned_value);
-    if(parsed.ec!=std::errc{} || parsed.ptr!=s.data()+s.size()) throw std::runtime_error("十进制整数超出范围");
+    uint64_t unsigned_value=0;
+    for(size_t i=first;i<=last;++i)if(mantissa[i]!='.') {
+        const auto digit=uint64_t(mantissa[i]-'0');
+        if(unsigned_value>(UINT64_MAX-digit)/10)throw std::runtime_error("十进制整数超出范围");
+        unsigned_value=unsigned_value*10+digit;
+    }
     __int128 value=unsigned_value;
     if(negative) value=-value;
     while(decimals<0) { value*=10; ++decimals; }

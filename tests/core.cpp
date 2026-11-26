@@ -1,4 +1,5 @@
 #include <mktpack/core.hpp>
+#include <mktpack/decimal.hpp>
 #include <stdexcept>
 
 namespace {
@@ -9,6 +10,10 @@ void expect(bool value, const char* message) {
 
 int main() {
     using namespace mktpack;
+    int literal_scale=0;
+    expect(decimal_integer("001.2300e+2",&literal_scale).value==123 && literal_scale==2,"十进制指数解析错误");
+    expect(decimal_integer("-9223372036854775808").value==INT64_MIN,"int64 下界解析错误");
+    expect(decimal_integer(".000").value==0,"零值解析错误");
     Table table;
     table.columns={{"time",{1,1,3}},{"open",{12,14,17}},{"high",{15,18,19}},
                    {"low",{10,12,14}},{"close",{13,17,15}},{"taker_buy_volume",{5,0,17}}};
