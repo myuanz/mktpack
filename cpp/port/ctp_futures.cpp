@@ -905,7 +905,18 @@ public:
     }
 };
 
-void archive_year(Database& index,Profile& profile,const std::string& path,const std::vector<StoredDay>& days) {
+using VolumeRefs=std::map<int64_t,int64_t>;
+
+VolumeRefs volume_refs(Database& db) {
+    VolumeRefs result;
+    Statement q(db,"SELECT volume_id,count(*) FROM __timefile__ WHERE volume_id IS NOT NULL GROUP BY volume_id "
+                   "UNION ALL SELECT volume_id,count(*) FROM __sqlite_partitions__ WHERE volume_id IS NOT NULL GROUP BY volume_id");
+    while(q.next())result[q.integer(0)]+=q.integer(1);
+    return result;
+}
+
+void archive_year(Database& index,Profile& profile,const std::string& path,
+                  const std::vector<StoredDay>& days,VolumeRefs& refs) {
     auto total=profile.scope(Stage::year_total);
     profile.count(Counter::year_days,days.size());
     const auto destination=volume_file(index,path),temporary=fs::path(destination.string()+".tmp");
@@ -928,26 +939,24 @@ void archive_year(Database& index,Profile& profile,const std::string& path,const
     fs::remove(destination);
     fs::rename(temporary,destination);
 
-    std::map<int64_t,std::string> old;
-    for(const auto& day:days)if(day.path!=path)old.emplace(day.volume,day.path);
+    std::vector<std::string> retired;
     index.exec("BEGIN IMMEDIATE");
     try {
         const auto volume=volume_id(index,path);
         Statement update(index,"UPDATE __timefile__ SET volume_id=? WHERE id=?");
+        Statement erase(index,"DELETE FROM __volumes__ WHERE id=?");
         for(const auto& day:days) {
+            if(day.volume==volume)continue;
             update.integer(1,volume);update.integer(2,day.id);update.next();sqlite3_reset(update.statement);
-        }
-        for(const auto& [id,source]:old) {
-            Statement used(index,"SELECT 1 FROM __timefile__ WHERE volume_id=? LIMIT 1");used.integer(1,id);
-            if(used.next())continue;
-            Statement erase(index,"DELETE FROM __volumes__ WHERE id=?");erase.integer(1,id);erase.next();
+            ++refs[volume];
+            if(--refs.at(day.volume)==0) {
+                erase.integer(1,day.volume);erase.next();sqlite3_reset(erase.statement);
+                retired.push_back(day.path);
+            }
         }
         index.exec("COMMIT");
     } catch(...) {index.exec("ROLLBACK");throw;}
-    for(const auto& [id,source]:old) {
-        Statement used(index,"SELECT 1 FROM __volumes__ WHERE id=?");used.integer(1,id);
-        if(!used.next())fs::remove(volume_file(index,source));
-    }
+    for(const auto& source:retired)fs::remove(volume_file(index,source));
 }
 
 void compact_volumes(Database& db,Profile& profile,const Catalog& catalog,int today) {
@@ -996,6 +1005,7 @@ void compact_volumes(Database& db,Profile& profile,const Catalog& catalog,int to
             "JOIN __volumes__ v ON v.id=f.volume_id WHERE f.group_id=? "
             "AND f.symbol_id=(SELECT id FROM __symbols__ WHERE name=?) "
             "AND f.period>=? AND f.period<? ORDER BY f.period");
+    std::optional<VolumeRefs> refs;
     for(const auto& [symbol,period]:years) {
         const auto path=tick_volume(symbol,period);
         std::vector<StoredDay> days;
@@ -1008,7 +1018,11 @@ void compact_volumes(Database& db,Profile& profile,const Catalog& catalog,int to
             sqlite3_reset(year_days.statement);
         }
         if(std::all_of(days.begin(),days.end(),[&](const auto& day){return day.path==path;}))continue;
-        archive_year(db,profile,path,days);
+        if(!refs) {
+            auto timer=profile.scope(Stage::archive_scan);
+            refs=volume_refs(db);
+        }
+        archive_year(db,profile,path,days,*refs);
     }
 }
 

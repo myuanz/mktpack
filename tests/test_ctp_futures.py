@@ -216,7 +216,8 @@ def test_completed_months_use_separate_volumes(tmp_path):
     assert mktpack.open(root)['tick'].read(symbol='AP2701').num_rows == 2
 
 
-def test_historical_bulk_writes_directly_then_incremental_retires_month(tmp_path):
+@pytest.mark.parametrize('shared_month', [False, True], ids=['retire_month', 'keep_shared_month'])
+def test_historical_bulk_writes_directly_then_incremental_archives_month(tmp_path, shared_month):
     mirror, root = tmp_path/'mirror', tmp_path/'data'
     for day, stamp in ((20240902, 1725238800000), (20241008, 1728349200000)):
         row = tick('SHFE', 'cu2412', stamp, '70000', day%100)
@@ -233,15 +234,32 @@ def test_historical_bulk_writes_directly_then_incremental_retires_month(tmp_path
     assert bulk['counters']['bulk_days'] == 1
     assert bulk['counters']['month_days'] == bulk['counters']['year_days'] == 0
     assert 'mkp_write' not in bulk['stages']
-    assert sorted(p.name for p in (root/'tick/CU2412').iterdir()) == ['2024.data']
+    folder = root/'tick/CU2412'
+    assert sorted(p.name for p in folder.iterdir()) == ['2024.data']
+    month = folder/'202410.data'
+    if shared_month:
+        with sqlite3.connect(month) as db:
+            db.execute('CREATE TABLE rates(time INTEGER, rate INTEGER)')
+            db.execute('INSERT INTO rates VALUES(1728349200000, 3)')
+        with sqlite3.connect(root/'mkt.sqlite') as db:
+            group = db.execute("INSERT INTO __group__(name,kind,storage) VALUES('rates','timeseries','sqlite')").lastrowid
+            volume = db.execute('INSERT INTO __volumes__(path) VALUES(?)', (str(month.relative_to(root)),)).lastrowid
+            db.execute('INSERT INTO __sqlite_partitions__ VALUES(?,?,?,?,?,?,?)',
+                       (group, 1727740800000, 1730419200000, volume, 1, 1728349200000, 1728349200000))
 
     incremental = run('2024-10-01', '2024-11-01', 'incremental.json')
     assert incremental['counters']['bulk_days'] == 0
     assert incremental['counters']['month_days'] == 1
     assert incremental['counters']['year_days'] == 2
-    assert sorted(p.name for p in (root/'tick/CU2412').iterdir()) == ['2024.data']
+    expected = [folder/'2024.data', month] if shared_month else [folder/'2024.data']
+    assert sorted(folder.iterdir()) == expected
     with sqlite3.connect(root/'mkt.sqlite') as db:
-        assert db.execute('SELECT path FROM __volumes__').fetchall() == [('tick/CU2412/2024.data',)]
+        assert db.execute('SELECT path FROM __volumes__ ORDER BY path').fetchall() == [
+            (str(path.relative_to(root)),) for path in expected
+        ]
+    if shared_month:
+        with sqlite3.connect(month) as db:
+            assert db.execute('SELECT rate FROM rates').fetchall() == [(3,)]
     assert mktpack.open(root)['tick'].read(symbol='CU2412', columns=['volume'])['volume'].to_pylist() == [2, 8]
 
 
