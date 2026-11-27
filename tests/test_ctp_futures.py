@@ -44,7 +44,7 @@ def tick(market: str, symbol: str, time: int, price: str, volume: int, unique: s
 
 def cli(root: Path, *args: str) -> dict:
     command = [shutil.which('mkt'), '--root', str(root), *map(str, args)]
-    return json.loads(subprocess.run(command, capture_output=True, check=True, text=True).stdout)
+    return json.loads(subprocess.run(command, capture_output=True, check=True, text=True, encoding='utf-8').stdout)
 
 
 def test_subset_incremental_tick_import_and_archive(tmp_path):

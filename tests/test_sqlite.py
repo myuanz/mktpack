@@ -153,7 +153,7 @@ def test_check_sqlite_volume_damage(monthly_sqlite, tmp_path, damage):
     else:
         with sqlite3.connect(packed / 'mkt.sqlite') as db:
             db.execute('UPDATE __sqlite_partitions__ SET volume_id=999')
-    result = subprocess.run([shutil.which('mkt'), '--root', str(packed), 'binance', 'check'], capture_output=True, text=True)
+    result = subprocess.run([shutil.which('mkt'), '--root', str(packed), 'binance', 'check'], capture_output=True, text=True, encoding='utf-8')
     assert result.returncode == 1
     assert json.loads(result.stdout)['errors']
 

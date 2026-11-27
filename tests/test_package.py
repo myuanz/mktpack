@@ -19,7 +19,7 @@ def run_package(root, destination, *, error=None, **options):
     for name, value in options.items():
         command.append('--' + name.replace('_', '-'))
         command.extend(map(str, value if isinstance(value, list) else [value]))
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8')
     if error is not None:
         assert result.returncode == 1, result.stderr
         assert error in result.stderr
@@ -29,7 +29,7 @@ def run_package(root, destination, *, error=None, **options):
 
 
 def check_package(root):
-    result = subprocess.run([shutil.which('mkt'), '--root', str(root), 'binance', 'check'], capture_output=True, text=True)
+    result = subprocess.run([shutil.which('mkt'), '--root', str(root), 'binance', 'check'], capture_output=True, text=True, encoding='utf-8')
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)['errors'] == []
 
@@ -171,7 +171,7 @@ def test_package_volumes_repack_and_index_path(source, tmp_path):
     assert all(p.read_bytes() == data for p, data in before.items())
     index_before = (destination / 'mkt.sqlite').read_bytes()
     download = subprocess.run([shutil.which('mkt'), '--root', str(destination), 'binance', 'download',
-                               '--symbols', 'BTCUSDT', '--groups', 'kline'], capture_output=True, text=True)
+                               '--symbols', 'BTCUSDT', '--groups', 'kline'], capture_output=True, text=True, encoding='utf-8')
     assert download.returncode == 1 and '不支持下载写入' in download.stderr
     assert (destination / 'mkt.sqlite').read_bytes() == index_before
 
@@ -272,7 +272,7 @@ def test_size_boundary_rejection_and_index_warning(source, tmp_path):
     assert mktpack.open(empty)['exchangeinfo'] == mktpack.open(root)['exchangeinfo']
     check_package(empty)
     download = subprocess.run([shutil.which('mkt'), '--root', str(empty), 'binance', 'download',
-                               '--symbols', 'BTCUSDT', '--groups', 'kline'], capture_output=True, text=True)
+                               '--symbols', 'BTCUSDT', '--groups', 'kline'], capture_output=True, text=True, encoding='utf-8')
     assert download.returncode == 1 and '不支持下载写入' in download.stderr
 
 
@@ -328,7 +328,7 @@ def test_check_reports_missing_packed_payload(source, tmp_path, damage):
     else:
         with sqlite3.connect(destination / 'mkt.sqlite') as db:
             db.execute('UPDATE __timefile__ SET volume_id=999 WHERE id=1')
-    command = subprocess.run([shutil.which('mkt'), '--root', str(destination / 'mkt.sqlite'), 'binance', 'check'], capture_output=True, text=True)
+    command = subprocess.run([shutil.which('mkt'), '--root', str(destination / 'mkt.sqlite'), 'binance', 'check'], capture_output=True, text=True, encoding='utf-8')
     assert command.returncode == 1
     assert json.loads(command.stdout)['errors']
 
@@ -338,16 +338,16 @@ def test_cli_package_and_invalid_arguments(source, tmp_path):
     command = [shutil.which('mkt'), '--root', str(root / 'mkt.sqlite'), 'package']
     destination = tmp_path / 'cli'
     done = subprocess.run([*command, str(destination), '--max-file-size', '32KiB', '--groups', 'kline', '--symbols', 'BTCUSDT',
-                           '--start', '2025-01-01', '--end', '2026-01-01'], capture_output=True, text=True)
+                           '--start', '2025-01-01', '--end', '2026-01-01'], capture_output=True, text=True, encoding='utf-8')
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout)['files'] == 2
     assert '复制' in done.stderr
     assert mktpack.open(destination)['kline'].read().num_rows == 3
     for size in ['0', '-1', '1XB']:
-        failed = subprocess.run([*command, str(tmp_path / 'invalid'), '--max-file-size', size], capture_output=True, text=True)
+        failed = subprocess.run([*command, str(tmp_path / 'invalid'), '--max-file-size', size], capture_output=True, text=True, encoding='utf-8')
         assert failed.returncode != 0
     for jobs in ['0', '-1']:
-        failed = subprocess.run([*command, str(tmp_path / 'invalid-jobs'), '--jobs', jobs], capture_output=True, text=True)
+        failed = subprocess.run([*command, str(tmp_path / 'invalid-jobs'), '--jobs', jobs], capture_output=True, text=True, encoding='utf-8')
         assert failed.returncode != 0
     run_package(root, tmp_path / 'dates', start=20250101, end=20240101, error='start < end')
     run_package(root, tmp_path / 'unknown', groups=['missing'], error='未知数据组')
