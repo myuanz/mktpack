@@ -82,18 +82,20 @@ mktpack::Json json_argument(nb::handle value) {
 }
 
 NB_MODULE(_native, module) {
-    nb::class_<Group>(module,"Group")
+    nb::class_<Group>(module,"Group","数据集中的时序数据组。")
         .def(nb::init<fs::path,std::string>(),nb::arg("root"),nb::arg("name"))
-        .def_prop_ro("root",[](const Group& group){return group.root.string();})
-        .def_ro("name",&Group::name)
+        .def_prop_ro("root",[](const Group& group){return group.root.string();},"数据集根目录或索引路径。")
+        .def_ro("name",&Group::name,"数据组名称。")
         .def("describe",[](const Group& group,const std::optional<std::string>& symbol){
             return describe(group.root,group.name,symbol.value_or(std::string{}));
-        },nb::arg("symbol")=nb::none())
+        },nb::arg("symbol")=nb::none(),
+          "返回数据组（或指定 symbol）的 schema、行数与 UTC datetime 首末时间（first_time/last_time）。")
         .def("symbols",[](const Group& group,nb::object start,nb::object end) {
             const auto first=timestamp(start,INT64_MIN),last=timestamp(end,INT64_MAX);
             nb::gil_scoped_release release;
             return mktpack::symbols(group.root,group.name,first,last);
-        },nb::kw_only(),nb::arg("start")=nb::none(),nb::arg("end")=nb::none())
+        },nb::kw_only(),nb::arg("start")=nb::none(),nb::arg("end")=nb::none(),
+          "返回在 UTC [start, end) 区间内实际有记录的品种列表（按名称排序）。start/end 支持 YYYYMMDD 整数、UTC 毫秒整数、ISO 字符串、date 或 datetime（无时区按 UTC 解释）。")
         .def("read",[](const Group& group,const std::optional<std::string>& symbol,
                        std::optional<std::vector<std::string>> symbols,nb::object start,nb::object end,
                        const mktpack::Projection& columns) {
@@ -109,16 +111,17 @@ NB_MODULE(_native, module) {
             }
             return mktpack::bindings::arrow_table(std::move(result));
         },nb::kw_only(),nb::arg("symbol")=nb::none(),nb::arg("symbols")=nb::none(),
-          nb::arg("start")=nb::none(),nb::arg("end")=nb::none(),nb::arg("columns")=nb::none());
+          nb::arg("start")=nb::none(),nb::arg("end")=nb::none(),nb::arg("columns")=nb::none(),
+          "按合约、UTC [start, end) 时间区间与列投影读取时序数据，返回 pyarrow.Table。start/end 支持 YYYYMMDD 整数、UTC 毫秒整数、ISO 字符串、date 或 datetime（无时区按 UTC 解释）。");
 
-    nb::class_<Dataset>(module,"Dataset")
+    nb::class_<Dataset>(module,"Dataset","MktPack 数据集入口，支持普通目录、打包目录和 mkt.sqlite 索引路径。")
         .def(nb::init<fs::path>(),nb::arg("root"))
-        .def_prop_ro("root",[](const Dataset& dataset){return dataset.root.string();})
-        .def("describe",[](const Dataset& dataset){return describe(dataset.root);})
+        .def_prop_ro("root",[](const Dataset& dataset){return dataset.root.string();},"数据集根目录或索引路径。")
+        .def("describe",[](const Dataset& dataset){return describe(dataset.root);},"列出数据集内所有数据组的名称、类型与存储载体。")
         .def("keys",[](const Dataset& dataset) {
             nb::gil_scoped_release release;
             return mktpack::groups(dataset.root);
-        })
+        },"返回按名称排序的所有数据组名列表。")
         .def("__len__",[](const Dataset& dataset) {
             nb::gil_scoped_release release;
             return mktpack::groups(dataset.root).size();
@@ -146,10 +149,11 @@ NB_MODULE(_native, module) {
             if(!kind)throw nb::key_error(name.c_str());
             if(kind=="ordinary")return python_value(result);
             return nb::cast(Group{dataset.root,name});
-        },nb::arg("name"));
-    module.def("open",[](fs::path root){return Dataset{std::move(root)};},nb::arg("root"));
+        },nb::arg("name"),"按名称获取时序数据组（Group）或普通表数据（dict / list[dict]）。");
+    module.def("open",[](fs::path root){return Dataset{std::move(root)};},nb::arg("root"),
+               "打开 MktPack 数据集目录或 mkt.sqlite 索引文件。");
 
-    auto raw=module.def_submodule("raw");
+    auto raw=module.def_submodule("raw","单个 .mkp 文件的底层读写与头部检查接口。");
     raw.def("write", [](const fs::path& path,nb::handle source,nb::handle schema,
                        nb::handle metadata,bool lossy_taker) {
         auto table=mktpack::bindings::table_from_arrow(source,json_argument(schema),json_argument(metadata));
@@ -163,7 +167,8 @@ NB_MODULE(_native, module) {
         nb::gil_scoped_release release;
         mktpack::write(path,table);
     },nb::arg("path"),nb::arg("table"),nb::kw_only(),nb::arg("schema")=nb::none(),
-      nb::arg("metadata")=nb::none(),nb::arg("lossy_taker")=false);
+      nb::arg("metadata")=nb::none(),nb::arg("lossy_taker")=false,
+      "将 pyarrow.Table 写入单个 .mkp 文件。");
     raw.def("read", [](const fs::path& path) {
         mktpack::QueryResult result;
         {
@@ -171,8 +176,9 @@ NB_MODULE(_native, module) {
             result=mktpack::file_result(path);
         }
         return mktpack::bindings::arrow_table(std::move(result));
-    },nb::arg("path"));
-    raw.def("info", [](const fs::path& path) {return python_value(mktpack::info(path));},nb::arg("path"));
+    },nb::arg("path"),"读取单个 .mkp 文件并返回 pyarrow.Table。");
+    raw.def("info", [](const fs::path& path) {return python_value(mktpack::info(path));},nb::arg("path"),
+            "仅读取单个 .mkp 文件头元数据并返回 dict。");
     module.def("merge", [](const std::vector<fs::path>& paths,const fs::path& destination) {
         nb::gil_scoped_release release;
         mktpack::merge_files({paths.begin(),paths.end()}, destination);

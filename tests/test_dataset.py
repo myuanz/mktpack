@@ -1,7 +1,9 @@
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
+import shutil
 import sqlite3
+import subprocess
 import pyarrow as pa
 import mktpack
 import pytest
@@ -121,3 +123,17 @@ def test_dataset_discovery_and_symbols(tmp_path):
     assert funding.describe("SOLUSDT")["first_time"] == datetime(1970, 1, 1, 0, 0, 3, tzinfo=timezone.utc)
     assert kline.symbols(start=2000, end=4000) == ["ETHUSDT"]
     assert kline.read(symbol="ETHUSDT", start=eth_desc["first_time"], end=4000).num_rows == 1
+
+    # CLI describe / symbols 与 info 目录误用提示
+    mkt = shutil.which("mkt")
+    cli_groups = json.loads(subprocess.run([mkt, "--root", str(tmp_path), "describe"],
+                                           capture_output=True, text=True, encoding="utf-8", check=True).stdout)
+    assert [g["name"] for g in cli_groups] == ["funding", "info", "kline"]
+    cli_eth = json.loads(subprocess.run([mkt, "--root", str(tmp_path), "describe", "kline", "--symbol", "ETHUSDT"],
+                                        capture_output=True, text=True, encoding="utf-8", check=True).stdout)
+    assert cli_eth["rows"] == 1 and cli_eth["first_time"] == "1970-01-01T00:00:03.000Z"
+    cli_syms = subprocess.run([mkt, "--root", str(tmp_path), "symbols", "kline"],
+                              capture_output=True, text=True, encoding="utf-8", check=True).stdout.splitlines()
+    assert cli_syms == ["BTCUSDT", "ETHUSDT"]
+    bad_info = subprocess.run([mkt, "info", str(tmp_path)], capture_output=True, text=True, encoding="utf-8")
+    assert bad_info.returncode != 0 and "describe" in bad_info.stderr

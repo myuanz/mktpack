@@ -3,10 +3,32 @@
 #include <mktpack/storage.hpp>
 #include <CLI/CLI.hpp>
 #include <chrono>
+#include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include "progress.hpp"
 
 namespace {
+std::filesystem::path utf8_path(const std::string& text) {
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()),text.size()));
+}
+
+std::string format_utc_ms(int64_t ms) {
+    using namespace std::chrono;
+    const auto tp=sys_time<milliseconds>{milliseconds{ms}};
+    const auto dp=floor<days>(tp);
+    const year_month_day ymd{dp};
+    const hh_mm_ss hms{tp-dp};
+    char buf[32];
+    std::snprintf(buf,sizeof(buf),"%04d-%02u-%02uT%02lld:%02lld:%02lld.%03lldZ",
+                  int(ymd.year()),unsigned(ymd.month()),unsigned(ymd.day()),
+                  static_cast<long long>(hms.hours().count()),
+                  static_cast<long long>(hms.minutes().count()),
+                  static_cast<long long>(hms.seconds().count()),
+                  static_cast<long long>(hms.subseconds().count()));
+    return buf;
+}
+
 uint64_t file_size(const std::string& text) {
     if (text.empty() || text.front()<'0' || text.front()>'9') throw std::runtime_error("分卷大小格式错误");
     size_t used=0;
@@ -24,21 +46,30 @@ int main(int argc, char** argv) {
     CLI::App app{"MktPack"};
     std::string root=".", file, start="2024-01-01", end, cache;
     mktpack::binance::Options options;
-    app.add_option("--root", root);
-    auto info=app.add_subcommand("info");
-    info->add_option("file", file)->required();
-    auto binance=app.add_subcommand("binance");
-    auto download=binance->add_subcommand("download");
+    app.add_option("--root", root, "数据集目录或 mkt.sqlite 索引路径（默认当前目录）");
+    auto info=app.add_subcommand("info","查看单个 .mkp 文件头元数据");
+    info->add_option("file", file, "单个 .mkp 文件路径")->required();
+    auto describe_cmd=app.add_subcommand("describe","查看数据集或指定数据组的概览信息");
+    std::string describe_group, describe_symbol;
+    describe_cmd->add_option("group", describe_group, "数据组名称（省略时列出所有数据组）");
+    describe_cmd->add_option("--symbol", describe_symbol, "按单个合约查询行数与时间范围");
+    auto symbols_cmd=app.add_subcommand("symbols","列出数据组在可选时间区间内有记录的合约");
+    std::string symbols_group, symbols_start, symbols_end;
+    symbols_cmd->add_option("group", symbols_group, "数据组名称")->required();
+    symbols_cmd->add_option("--start", symbols_start, "起始时间（含，UTC）");
+    symbols_cmd->add_option("--end", symbols_end, "结束时间（不含，UTC）");
+    auto binance=app.add_subcommand("binance","币安 USDT UM 永续数据下载与检查");
+    auto download=binance->add_subcommand("download","下载币安历史与增量行情数据");
     download->add_option("--symbols", options.symbols,"品种列表，省略时自动发现全部 USDT 品种")->expected(-1);
-    download->add_option("--groups", options.groups)->expected(-1);
-    download->add_option("--start", start);
-    download->add_option("--end", end);
-    download->add_option("--jobs", options.jobs)->check(CLI::PositiveNumber);
-    download->add_option("--source-cache", cache);
-    download->add_flag("--full", options.full);
+    download->add_option("--groups", options.groups,"数据组列表")->expected(-1);
+    download->add_option("--start", start,"起始时间（含，UTC）");
+    download->add_option("--end", end,"结束时间（不含，UTC）");
+    download->add_option("--jobs", options.jobs,"下载并发数（默认 4）")->check(CLI::PositiveNumber);
+    download->add_option("--source-cache", cache,"原始 ZIP 缓存目录");
+    download->add_flag("--full", options.full,"全量核对远端清单并补齐本地缺失数据");
     download->add_flag("--lossy-taker,!--no-lossy-taker", options.lossy_taker,
                        "主动买量按0.1个百分点量化（默认关闭）");
-    auto check=binance->add_subcommand("check");
+    auto check=binance->add_subcommand("check","检查数据集索引与载荷完整性");
     mktpack::ctp_futures::Options ctp_options;
     auto ctp=app.add_subcommand("ctp-futures","国内期货时序数据");
     auto check_ctp=ctp->add_subcommand("check","检查数据集索引与载荷");
@@ -63,7 +94,25 @@ int main(int argc, char** argv) {
     try {
         app.parse(argc,app.ensure_utf8(argv));
         if (*info) {
-            std::cout << mktpack::info(file).dump(2) << "\n";
+            const auto target=utf8_path(file);
+            if (std::filesystem::is_directory(target))
+                throw std::runtime_error("mkt info 仅用于单个 .mkp 文件；查看数据集请使用 mkt --root <目录> describe");
+            std::cout << mktpack::info(target).dump(2) << "\n";
+        } else if (*describe_cmd) {
+            if (!describe_symbol.empty() && describe_group.empty())
+                throw std::runtime_error("指定 --symbol 时必须同时提供数据组名称");
+            auto result=mktpack::describe(utf8_path(root),describe_group,describe_symbol);
+            if (result.is_object()) {
+                for (const auto* key:{"first_time","last_time"})
+                    if (result.contains(key) && result[key].is_number_integer())
+                        result[key]=format_utc_ms(result[key].get<int64_t>());
+            }
+            std::cout << result.dump(2) << "\n";
+        } else if (*symbols_cmd) {
+            const auto first=symbols_start.empty()?std::numeric_limits<int64_t>::min():mktpack::binance::timestamp(symbols_start);
+            const auto last=symbols_end.empty()?std::numeric_limits<int64_t>::max():mktpack::binance::timestamp(symbols_end);
+            for (const auto& name:mktpack::symbols(utf8_path(root),symbols_group,first,last))
+                std::cout << name << "\n";
         } else if (*download) {
             options.root=root;
             options.cache=cache;
