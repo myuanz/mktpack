@@ -4,7 +4,7 @@
 #include <limits>
 #include <optional>
 namespace mktpack {
-Json describe(const std::filesystem::path& root,const std::string& group="");
+Json describe(const std::filesystem::path& root,const std::string& group="",const std::string& symbol="");
 std::vector<std::string> groups(const std::filesystem::path& root);
 std::optional<std::string> group_kind(const std::filesystem::path& root,const std::string& group);
 std::vector<std::string> symbols(const std::filesystem::path& root,const std::string& group,

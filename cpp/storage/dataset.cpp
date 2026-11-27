@@ -9,7 +9,7 @@
 namespace mktpack {
 using namespace storage;
 
-Json describe(const std::filesystem::path& root, const std::string& group) {
+Json describe(const std::filesystem::path& root, const std::string& group, const std::string& symbol) {
     Database database(root);
     if (group.empty()) {
         Statement query(database,"SELECT name,kind,storage FROM __group__ ORDER BY name");
@@ -22,19 +22,62 @@ Json describe(const std::filesystem::path& root, const std::string& group) {
     if (spec.storage=="sqlite" && spec.kind=="timeseries") {
         SqlReader reader(database,spec);
         int64_t rows=0,first=INT64_MAX,last=INT64_MIN;
-        for (const auto& part:reader.partitions()) {
-            rows+=part.rows; first=std::min(first,part.first); last=std::max(last,part.last);
+        if (symbol.empty()) {
+            for (const auto& part:reader.partitions()) {
+                rows+=part.rows; first=std::min(first,part.first); last=std::max(last,part.last);
+            }
+        } else if (!spec.symbol.empty()) {
+            Statement lookup(database,"SELECT id FROM __symbols__ WHERE name=?");
+            lookup.text(1,symbol);
+            if (lookup.next()) {
+                const auto symbol_id=lookup.integer(0);
+                const auto sql="SELECT count(*),min("+identifier(spec.time)+"),max("+identifier(spec.time)+") FROM "+
+                               identifier(spec.table)+" WHERE "+identifier(spec.symbol)+"=?";
+                for (const auto& part:reader.partitions()) {
+                    Statement q(reader.database(part.volume),sql);
+                    q.integer(1,symbol_id);
+                    if (q.next() && q.integer(0)>0) {
+                        rows+=q.integer(0);
+                        first=std::min(first,q.integer(1));
+                        last=std::max(last,q.integer(2));
+                    }
+                }
+            }
         }
-        return {{"name",group},{"schema",schema},{"rows",rows},{"time_column",spec.time},
-                {"symbol_column",spec.symbol},{"first_time",rows?first:0},{"last_time",rows?last:0}};
+        Json result={{"name",group},{"schema",schema},{"rows",rows},{"time_column",spec.time},
+                     {"symbol_column",spec.symbol},
+                     {"first_time",rows?Json(first):Json(nullptr)},
+                     {"last_time",rows?Json(last):Json(nullptr)}};
+        if (!symbol.empty()) result["symbol"]=symbol;
+        return result;
     }
-    Statement stats(database,"SELECT sum(rows),min(first_time),max(last_time) FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id WHERE g.name=?");
-    stats.text(1,group);
-    stats.next();
-    return {{"name",group},{"schema",schema},
-            {"rows",sqlite3_column_int64(stats.statement,0)},
-            {"first_time",sqlite3_column_int64(stats.statement,1)},
-            {"last_time",sqlite3_column_int64(stats.statement,2)}};
+    int64_t rows=0;
+    Json first=nullptr,last=nullptr;
+    if (symbol.empty()) {
+        Statement stats(database,"SELECT coalesce(sum(rows),0),min(first_time),max(last_time) FROM __timefile__ WHERE group_id=? AND rows>0");
+        stats.integer(1,spec.id);
+        stats.next();
+        rows=sqlite3_column_int64(stats.statement,0);
+        if (rows>0) {
+            first=sqlite3_column_int64(stats.statement,1);
+            last=sqlite3_column_int64(stats.statement,2);
+        }
+    } else {
+        Statement stats(database,"SELECT coalesce(sum(f.rows),0),min(f.first_time),max(f.last_time) "
+                                 "FROM __timefile__ f JOIN __symbols__ s ON s.id=f.symbol_id "
+                                 "WHERE f.group_id=? AND s.name=? AND f.rows>0");
+        stats.integer(1,spec.id);
+        stats.text(2,symbol);
+        stats.next();
+        rows=sqlite3_column_int64(stats.statement,0);
+        if (rows>0) {
+            first=sqlite3_column_int64(stats.statement,1);
+            last=sqlite3_column_int64(stats.statement,2);
+        }
+    }
+    Json result={{"name",group},{"schema",schema},{"rows",rows},{"first_time",first},{"last_time",last}};
+    if (!symbol.empty()) result["symbol"]=symbol;
+    return result;
 }
 
 std::vector<std::string> groups(const std::filesystem::path& root) {
