@@ -108,3 +108,16 @@ def test_dataset_discovery_and_symbols(tmp_path):
     funding = dataset["funding"]
     assert funding.symbols() == ["BTCUSDT", "SOLUSDT"]
     assert funding.symbols(start="1970-01-01T00:00:02Z", end="1970-01-01T00:00:04Z") == ["SOLUSDT"]
+
+    # describe() 返回 UTC datetime，支持单合约描述，且毫秒时间戳可直接传给 read/symbols
+    kline_desc = kline.describe()
+    assert kline_desc["first_time"] == datetime(1970, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
+    assert kline_desc["last_time"] == datetime(1970, 1, 1, 0, 0, 5, tzinfo=timezone.utc)
+    eth_desc = kline.describe("ETHUSDT")
+    assert eth_desc["rows"] == 1 and eth_desc["symbol"] == "ETHUSDT"
+    assert eth_desc["first_time"] == datetime(1970, 1, 1, 0, 0, 3, tzinfo=timezone.utc)
+    assert kline.describe("UNKNOWN")["first_time"] is None
+    assert funding.describe("SOLUSDT")["rows"] == 1
+    assert funding.describe("SOLUSDT")["first_time"] == datetime(1970, 1, 1, 0, 0, 3, tzinfo=timezone.utc)
+    assert kline.symbols(start=2000, end=4000) == ["ETHUSDT"]
+    assert kline.read(symbol="ETHUSDT", start=eth_desc["first_time"], end=4000).num_rows == 1

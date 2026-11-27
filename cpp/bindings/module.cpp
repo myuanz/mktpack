@@ -27,7 +27,11 @@ int64_t timestamp(nb::object value,int64_t fallback) {
     if(value.is_none())return fallback;
     const auto dates=nb::module_::import_("datetime");
     const auto datetime=dates.attr("datetime");
-    if(nb::isinstance<nb::int_>(value))value=nb::str(value);
+    if(nb::isinstance<nb::int_>(value)) {
+        const auto raw=nb::cast<int64_t>(value);
+        if(raw>=10000101 && raw<=99991231)value=nb::str(value);
+        else return raw;
+    }
     if(nb::isinstance<nb::str>(value)) {
         value=nb::len(value)==8?datetime.attr("strptime")(value,"%Y%m%d")
                                :datetime.attr("fromisoformat")(value);
@@ -39,6 +43,13 @@ int64_t timestamp(nb::object value,int64_t fallback) {
     return static_cast<int64_t>(nb::cast<double>(value.attr("timestamp")())*1000);
 }
 
+nb::object utc_datetime(const mktpack::Json& value) {
+    if(value.is_null())return nb::none();
+    const auto dates=nb::module_::import_("datetime");
+    const auto epoch=dates.attr("datetime")(1970,1,1,nb::arg("tzinfo")=dates.attr("timezone").attr("utc"));
+    return epoch+dates.attr("timedelta")(nb::arg("milliseconds")=value.get<int64_t>());
+}
+
 struct Group {
     fs::path root;
     std::string name;
@@ -48,13 +59,19 @@ struct Dataset {
     fs::path root;
 };
 
-nb::object describe(const fs::path& root,const std::string& group={}) {
+nb::object describe(const fs::path& root,const std::string& group={},const std::string& symbol={}) {
     mktpack::Json result;
     {
         nb::gil_scoped_release release;
-        result=mktpack::describe(root,group);
+        result=mktpack::describe(root,group,symbol);
     }
-    return python_value(result);
+    auto obj=python_value(result);
+    if(!group.empty() && result.is_object()) {
+        auto dict=nb::cast<nb::dict>(obj);
+        if(result.contains("first_time"))dict["first_time"]=utc_datetime(result["first_time"]);
+        if(result.contains("last_time"))dict["last_time"]=utc_datetime(result["last_time"]);
+    }
+    return obj;
 }
 
 mktpack::Json json_argument(nb::handle value) {
@@ -69,7 +86,9 @@ NB_MODULE(_native, module) {
         .def(nb::init<fs::path,std::string>(),nb::arg("root"),nb::arg("name"))
         .def_prop_ro("root",[](const Group& group){return group.root.string();})
         .def_ro("name",&Group::name)
-        .def("describe",[](const Group& group){return describe(group.root,group.name);})
+        .def("describe",[](const Group& group,const std::optional<std::string>& symbol){
+            return describe(group.root,group.name,symbol.value_or(std::string{}));
+        },nb::arg("symbol")=nb::none())
         .def("symbols",[](const Group& group,nb::object start,nb::object end) {
             const auto first=timestamp(start,INT64_MIN),last=timestamp(end,INT64_MAX);
             nb::gil_scoped_release release;
