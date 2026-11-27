@@ -9,8 +9,25 @@
 #include <iostream>
 #include "progress.hpp"
 #include "skill.hpp"
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
+#ifdef _WIN32
+struct ConsoleUtf8 {
+    UINT out=GetConsoleOutputCP(), in=GetConsoleCP();
+    ConsoleUtf8() { SetConsoleOutputCP(CP_UTF8); SetConsoleCP(CP_UTF8); }
+    ~ConsoleUtf8() { SetConsoleOutputCP(out); SetConsoleCP(in); }
+};
+#endif
+
 std::filesystem::path utf8_path(const std::string& text) {
     return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()),text.size()));
 }
@@ -51,6 +68,9 @@ uint64_t file_size(const std::string& text) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    ConsoleUtf8 console_utf8;
+#endif
     CLI::App app{"MktPack"};
     std::string root=".", file, start="2024-01-01", end, cache;
     mktpack::binance::Options options;
