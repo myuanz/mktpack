@@ -4,12 +4,34 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "mktpack"
 version = "0.1.0"
-description = "精确金融时序数据格式与读写库"
+description = "高压缩的金融时序数据格式与读写库"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [{ name = "myuanz" }]
+keywords = ["finance", "timeseries", "market-data", "arrow", "quant", "compression"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Scientific/Engineering",
+]
 requires-python = ">=3.12"
-dependencies = ["pyarrow>=20", "numpy>=2"]
+dependencies = ["pyarrow>=20", "numpy>=2", "tzdata; sys_platform == 'win32'"]
+
+[project.urls]
+Homepage = "https://github.com/myuanz/mktpack"
+Repository = "https://github.com/myuanz/mktpack"
+Issues = "https://github.com/myuanz/mktpack/issues"
+
 [dependency-groups]
 dev = ["pytest>=8"]
 [tool.scikit-build]
@@ -17,11 +39,19 @@ wheel.packages = ["python/mktpack"]
 wheel.py-api = "cp312"
 cmake.build-type = "Release"
 build-dir = "build/{wheel_tag}"
+sdist.exclude = [
+    "AGENTS.md",
+    "实施计划.md",
+    "validation",
+    "data",
+    "dist",
+    "build",
+]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.cibuildwheel]
-build = "cp312-manylinux_*"
+build = ["cp312-manylinux_*", "cp312-win_amd64"]
 skip = "cp3*t-*"
 archs = ["native"]
 build-frontend = "build[uv]"
