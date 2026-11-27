@@ -1,0 +1,6 @@
+#pragma once
+#include <string_view>
+
+namespace mktpack::cli {
+inline constexpr std::string_view kSkillMarkdown = R"MKTPACK_SKILL(@MKTPACK_SKILL_CONTENT@)MKTPACK_SKILL";
+}

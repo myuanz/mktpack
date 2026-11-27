@@ -5,8 +5,10 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include "progress.hpp"
+#include "skill.hpp"
 
 namespace {
 std::filesystem::path utf8_path(const std::string& text) {
@@ -27,6 +29,12 @@ std::string format_utc_ms(int64_t ms) {
                   static_cast<long long>(hms.seconds().count()),
                   static_cast<long long>(hms.subseconds().count()));
     return buf;
+}
+
+std::filesystem::path skill_target(const std::filesystem::path& path) {
+    if (path.filename()=="SKILL.md") return path;
+    if (path.filename()=="mktpack") return path/"SKILL.md";
+    return path/"mktpack"/"SKILL.md";
 }
 
 uint64_t file_size(const std::string& text) {
@@ -91,6 +99,9 @@ int main(int argc, char** argv) {
     packing->add_option("--symbols",package_options.symbols)->expected(-1);
     packing->add_option("--start",package_start);
     packing->add_option("--end",package_end);
+    auto skill=app.add_subcommand("skill","输出或安装 MktPack Agent Skill");
+    std::string skill_install;
+    skill->add_option("--install",skill_install,"安装 SKILL.md 到指定目录或文件路径");
     try {
         app.parse(argc,app.ensure_utf8(argv));
         if (*info) {
@@ -139,6 +150,21 @@ int main(int argc, char** argv) {
             auto result=mktpack::check_dataset(root);
             std::cout << result.dump(2) << "\n";
             return result["errors"].empty()?0:1;
+        } else if (*skill) {
+            if (skill_install.empty()) {
+                std::cout << mktpack::cli::kSkillMarkdown;
+            } else {
+                const auto target=skill_target(std::filesystem::path(
+                    std::u8string(reinterpret_cast<const char8_t*>(skill_install.data()),skill_install.size())));
+                if (target.has_parent_path()) std::filesystem::create_directories(target.parent_path());
+                std::ofstream out(target,std::ios::binary|std::ios::trunc);
+                const auto u8=target.u8string();
+                const std::string display(reinterpret_cast<const char*>(u8.data()),u8.size());
+                if (!out) throw std::runtime_error("无法写入："+display);
+                out.write(mktpack::cli::kSkillMarkdown.data(),static_cast<std::streamsize>(mktpack::cli::kSkillMarkdown.size()));
+                if (!out) throw std::runtime_error("写入失败："+display);
+                std::cout << display << "\n";
+            }
         } else {
             std::cout << app.help();
         }
