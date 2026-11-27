@@ -70,6 +70,11 @@ NB_MODULE(_native, module) {
         .def_prop_ro("root",[](const Group& group){return group.root.string();})
         .def_ro("name",&Group::name)
         .def("describe",[](const Group& group){return describe(group.root,group.name);})
+        .def("symbols",[](const Group& group,nb::object start,nb::object end) {
+            const auto first=timestamp(start,INT64_MIN),last=timestamp(end,INT64_MAX);
+            nb::gil_scoped_release release;
+            return mktpack::symbols(group.root,group.name,first,last);
+        },nb::kw_only(),nb::arg("start")=nb::none(),nb::arg("end")=nb::none())
         .def("read",[](const Group& group,const std::optional<std::string>& symbol,
                        std::optional<std::vector<std::string>> symbols,nb::object start,nb::object end,
                        const mktpack::Projection& columns) {
@@ -91,6 +96,26 @@ NB_MODULE(_native, module) {
         .def(nb::init<fs::path>(),nb::arg("root"))
         .def_prop_ro("root",[](const Dataset& dataset){return dataset.root.string();})
         .def("describe",[](const Dataset& dataset){return describe(dataset.root);})
+        .def("keys",[](const Dataset& dataset) {
+            nb::gil_scoped_release release;
+            return mktpack::groups(dataset.root);
+        })
+        .def("__len__",[](const Dataset& dataset) {
+            nb::gil_scoped_release release;
+            return mktpack::groups(dataset.root).size();
+        })
+        .def("__iter__",[](const Dataset& dataset) {
+            std::vector<std::string> names;
+            {
+                nb::gil_scoped_release release;
+                names=mktpack::groups(dataset.root);
+            }
+            return nb::iter(nb::cast(std::move(names)));
+        })
+        .def("__contains__",[](const Dataset& dataset,const std::string& name) {
+            nb::gil_scoped_release release;
+            return mktpack::group_kind(dataset.root,name).has_value();
+        },nb::arg("name"))
         .def("__getitem__",[](const Dataset& dataset,const std::string& name) {
             std::optional<std::string> kind;
             mktpack::Json result;

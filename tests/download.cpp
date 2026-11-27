@@ -113,7 +113,8 @@ int main() {
     options.end=timestamp("2024-03-01");
     download(options);
     expect(read(annual).columns.at("time").size()==2,"局部恢复后增量补另一月失败");
-    expect(info(annual)["metadata"].contains("lossy_columns"),"默认下载未启用有损编码");
+    expect(!info(annual)["metadata"].contains("lossy_columns"),"默认下载未保持无损编码");
+    expect(read(annual).columns.at("taker_buy_volume")==std::vector<int64_t>({4,5}),"默认无损下载数值改变");
     {
         DB db(root/"mkt.sqlite");
         sqlite3_stmt* query=nullptr;
@@ -170,13 +171,12 @@ int main() {
         expect(counts.integer(2)==nodes,"新增品种重复存储了路径模板");
 
     }
-    auto lossless_options=options;
-    lossless_options.root=root/"exact";
-    lossless_options.lossy_taker=false;
-    download(lossless_options);
-    const auto exact=lossless_options.root/"kline/BTCUSDT/2024.mkp";
-    expect(!info(exact)["metadata"].contains("lossy_columns"),"关闭有损编码未生效");
-    expect(read(exact).columns.at("taker_buy_volume")==std::vector<int64_t>{5},"无损下载数值改变");
+    auto lossy_options=options;
+    lossy_options.root=root/"lossy";
+    lossy_options.lossy_taker=true;
+    download(lossy_options);
+    const auto lossy=lossy_options.root/"kline/BTCUSDT/2024.mkp";
+    expect(info(lossy)["metadata"].contains("lossy_columns"),"开启有损编码未生效");
     auto rest_options=options;
     rest_options.root=root/"rest";
     rest_options.groups={};

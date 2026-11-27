@@ -37,12 +37,90 @@ Json describe(const std::filesystem::path& root, const std::string& group) {
             {"last_time",sqlite3_column_int64(stats.statement,2)}};
 }
 
+std::vector<std::string> groups(const std::filesystem::path& root) {
+    Database database(root);
+    Statement query(database,"SELECT name FROM __group__ ORDER BY name");
+    std::vector<std::string> names;
+    while(query.next())names.push_back(query.text(0));
+    return names;
+}
+
 std::optional<std::string> group_kind(const std::filesystem::path& root, const std::string& group) {
     Database database(root);
     Statement query(database,"SELECT kind FROM __group__ WHERE name=?");
     query.text(1,group);
     if(!query.next())return std::nullopt;
     return query.text(0);
+}
+
+std::vector<std::string> symbols(const std::filesystem::path& root, const std::string& group,
+                                 int64_t start, int64_t end) {
+    Database database(root);
+    const auto spec=group_spec(database,group);
+    if(start>=end)return {};
+    if(spec.storage=="sqlite") {
+        if(spec.kind!="timeseries" || spec.symbol.empty())return {};
+        SqlReader reader(database,spec);
+        std::set<int64_t> ids;
+        const auto sql="SELECT DISTINCT "+identifier(spec.symbol)+" FROM "+identifier(spec.table)+
+                       " WHERE "+identifier(spec.time)+">=? AND "+identifier(spec.time)+"<? AND "+
+                       identifier(spec.symbol)+" IS NOT NULL";
+        for(const auto& part:reader.partitions(start,end)) {
+            Statement q(reader.database(part.volume),sql);
+            q.integer(1,std::max(start,part.start));
+            q.integer(2,std::min(end,part.end));
+            while(q.next())ids.insert(q.integer(0));
+        }
+        if(ids.empty())return {};
+        std::string lookup="SELECT name FROM __symbols__ WHERE id IN (";
+        for(size_t i=0;i<ids.size();++i)lookup+=(i?",?":"?");
+        lookup+=") ORDER BY name";
+        Statement names(database,lookup);
+        int index=1;
+        for(const auto id:ids)names.integer(index++,id);
+        std::vector<std::string> result;
+        while(names.next())result.push_back(names.text(0));
+        return result;
+    }
+    Statement files(database,
+        "SELECT s.name,g.name||'/'||s.name||'/'||f.period||'.mkp',f.id,coalesce(v.path,''),f.first_time,f.last_time "
+        "FROM __timefile__ f JOIN __group__ g ON g.id=f.group_id JOIN __symbols__ s ON s.id=f.symbol_id "
+        "LEFT JOIN __volumes__ v ON v.id=f.volume_id "
+        "WHERE g.name=? AND f.rows>0 AND f.first_time<? AND f.last_time>=? "
+        "ORDER BY s.name,f.first_time,f.period,f.id");
+    files.text(1,group);
+    files.integer(2,end);
+    files.integer(3,start);
+    struct Candidate { std::string symbol,path,volume; int64_t id; };
+    std::set<std::string> confirmed;
+    std::vector<Candidate> uncertain;
+    while(files.next()) {
+        auto symbol=files.text(0);
+        if(confirmed.contains(symbol))continue;
+        const auto first=files.integer(4),last=files.integer(5);
+        if(first>=start || last<end)confirmed.insert(std::move(symbol));
+        else uncertain.push_back({std::move(symbol),files.text(1),files.text(3),files.integer(2)});
+    }
+    if(!uncertain.empty()) {
+        const std::vector<std::string> time_only{"time"};
+        std::map<std::string,std::unique_ptr<Database>> volumes;
+        for(const auto& entry:uncertain) {
+            if(confirmed.contains(entry.symbol))continue;
+            std::vector<uint8_t> bytes;
+            if(entry.volume.empty())bytes=read_file_bytes(database.root/entry.path);
+            else {
+                auto& volume=volumes[entry.volume];
+                if(!volume)volume=std::make_unique<Database>(database.root/std::filesystem::path(entry.volume));
+                Statement blob(*volume,"SELECT bytes FROM blob WHERE id=?");
+                bytes=read_blob(blob,entry.id,entry.path);
+            }
+            const auto table=decode(bytes,time_only);
+            const auto& times=table.columns.at("time");
+            const auto it=std::lower_bound(times.begin(),times.end(),start);
+            if(it!=times.end() && *it<end)confirmed.insert(entry.symbol);
+        }
+    }
+    return {confirmed.begin(),confirmed.end()};
 }
 
 Json ordinary(const std::filesystem::path& root, const std::string& group) {

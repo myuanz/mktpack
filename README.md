@@ -18,7 +18,9 @@ uv add mktpack
 ```python
 import mktpack
 
-market = mktpack.open('data/binance') # TODO 添加检查所有可用数据的接口
+market = mktpack.open('data/binance')
+groups = market.describe()
+symbols = market['kline'].symbols(start=20260101, end=20260201)
 bars = market['kline'].read(
     symbol='BTCUSDT', start=20260101, end=20260201,
     columns=['time', 'close', 'volume'],

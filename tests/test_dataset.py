@@ -52,3 +52,59 @@ def test_query_scales_and_empty_schema(tmp_path):
     db.commit()
     (tmp_path / "oi/BTCUSDT/1.mkp").unlink()
     assert group.read(symbol="BTCUSDT")["value"].to_pylist() == [Decimal("1.200"), Decimal("2.345")]
+
+
+def test_dataset_discovery_and_symbols(tmp_path):
+    db = sqlite3.connect(tmp_path / "mkt.sqlite")
+    db.executescript("""
+        CREATE TABLE __group__(id INTEGER PRIMARY KEY, name TEXT UNIQUE, kind TEXT, schema TEXT,storage TEXT NOT NULL DEFAULT 'mkp',location TEXT NOT NULL DEFAULT '',table_name TEXT NOT NULL DEFAULT '',time_column TEXT NOT NULL DEFAULT 'time',symbol_column TEXT NOT NULL DEFAULT 'symbol_id');
+        CREATE TABLE __sqlite_partitions__(group_id INTEGER,start INTEGER,end INTEGER,volume_id INTEGER,rows INTEGER,first_time INTEGER,last_time INTEGER,PRIMARY KEY(group_id,start)) WITHOUT ROWID;
+        CREATE TABLE __symbols__(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+        CREATE TABLE __volumes__(id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE);
+        CREATE TABLE __timefile__(id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL, symbol_id INTEGER NOT NULL, period INTEGER NOT NULL, first_time INTEGER NOT NULL, last_time INTEGER NOT NULL, rows INTEGER NOT NULL, volume_id INTEGER, UNIQUE(group_id,symbol_id,period));
+        INSERT INTO __symbols__ VALUES (1, 'BTCUSDT'), (2, 'ETHUSDT'), (3, 'SOLUSDT');
+    """)
+    mkp_schema = {"time": {"type": "timestamp", "scale": 0}, "value": {"type": "integer", "scale": 0}}
+    sql_schema = {"time": {"type": "timestamp", "scale": 0}, "rate": {"type": "integer", "scale": 0}}
+    db.execute("INSERT INTO __group__(id,name,kind,schema) VALUES (1, 'kline', 'timeseries', ?)", (json.dumps(mkp_schema),))
+    db.execute("INSERT INTO __group__(id,name,kind,schema,storage,location,table_name,time_column,symbol_column) "
+               "VALUES (2, 'funding', 'timeseries', ?, 'sqlite', 'funding.sqlite', 'funding', 'time', 'symbol_id')",
+               (json.dumps(sql_schema),))
+    db.execute("INSERT INTO __group__(id,name,kind,schema,storage,table_name) VALUES (3, 'info', 'ordinary', '{}', 'sqlite', 'info')")
+    db.execute("CREATE TABLE info(exchange TEXT)")
+    db.execute("INSERT INTO info VALUES ('binance')")
+
+    # BTCUSDT 在 1000 和 5000 有记录，[2000, 4000) 内实际无记录
+    btc = pa.table({"time": pa.array([1000, 5000], type=pa.timestamp("ms", tz="UTC")), "value": [1, 2]})
+    raw.write(tmp_path / "kline/BTCUSDT/2024.mkp", btc, metadata={"symbol": "BTCUSDT"})
+    db.execute("INSERT INTO __timefile__(group_id,symbol_id,period,first_time,last_time,rows) VALUES (1,1,2024,1000,5000,2)")
+
+    # ETHUSDT 在 3000 有记录
+    eth = pa.table({"time": pa.array([3000], type=pa.timestamp("ms", tz="UTC")), "value": [3]})
+    raw.write(tmp_path / "kline/ETHUSDT/2024.mkp", eth, metadata={"symbol": "ETHUSDT"})
+    db.execute("INSERT INTO __timefile__(group_id,symbol_id,period,first_time,last_time,rows) VALUES (1,2,2024,3000,3000,1)")
+    db.commit()
+
+    funding_db = sqlite3.connect(tmp_path / "funding.sqlite")
+    funding_db.executescript("""
+        CREATE TABLE funding(symbol_id INTEGER, time INTEGER, rate INTEGER);
+        INSERT INTO funding VALUES (1, 1000, 10), (3, 3000, 20);
+    """)
+    funding_db.commit()
+
+    dataset = mktpack.open(tmp_path)
+    assert dataset.keys() == ["funding", "info", "kline"]
+    assert list(dataset) == ["funding", "info", "kline"]
+    assert len(dataset) == 3
+    assert "kline" in dataset and "missing" not in dataset
+    assert [g["name"] for g in dataset.describe()] == ["funding", "info", "kline"]
+
+    kline = dataset["kline"]
+    assert kline.symbols() == ["BTCUSDT", "ETHUSDT"]
+    assert kline.symbols(start="1970-01-01T00:00:02Z", end="1970-01-01T00:00:04Z") == ["ETHUSDT"]
+    assert kline.symbols(start="1970-01-01T00:00:05Z", end="1970-01-01T00:00:06Z") == ["BTCUSDT"]
+    assert kline.symbols(start="1970-01-01T00:00:06Z", end="1970-01-01T00:00:05Z") == []
+
+    funding = dataset["funding"]
+    assert funding.symbols() == ["BTCUSDT", "SOLUSDT"]
+    assert funding.symbols(start="1970-01-01T00:00:02Z", end="1970-01-01T00:00:04Z") == ["SOLUSDT"]
