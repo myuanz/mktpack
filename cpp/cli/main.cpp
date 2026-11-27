@@ -37,7 +37,7 @@ int main(int argc, char** argv) {
     download->add_option("--source-cache", cache);
     download->add_flag("--full", options.full);
     download->add_flag("--lossy-taker,!--no-lossy-taker", options.lossy_taker,
-                       "主动买量按0.1个百分点量化（默认启用）");
+                       "主动买量按0.1个百分点量化（默认关闭）");
     auto check=binance->add_subcommand("check");
     mktpack::ctp_futures::Options ctp_options;
     auto ctp=app.add_subcommand("ctp-futures","国内期货时序数据");

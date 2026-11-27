@@ -13,7 +13,7 @@ struct Options {
     std::filesystem::path root,cache;
     std::vector<std::string> symbols,groups{"kline","oi","funding_rate_settlement","exchangeinfo"};
     int64_t start,end;
-    bool full=false,lossy_taker=true;
+    bool full=false,lossy_taker=false;
     size_t jobs=4;
     std::function<void(const Progress&)> progress;
 };

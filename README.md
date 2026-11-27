@@ -39,9 +39,7 @@ uv run mkt --root data/binance binance download --symbols BTCUSDT --start 2026-0
 
 省略 `--symbols` 自动发现全部 USDT 品种。
 
-币安下载默认将主动买量占比按 0.1 个百分点量化，添加 `--no-lossy-taker` 使用无损编码。`--full` 检查来源对应的本地载荷并补齐缺失数据。
-
-TODO: 交换默认量化
+币安下载默认使用无损编码，添加 `--lossy-taker` 将主动买量占比按 0.1 个百分点量化。`--full` 检查来源对应的本地载荷并补齐缺失数据。
 
 ## 导入中国期货 tick
 
