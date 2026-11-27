@@ -37,6 +37,14 @@ Json describe(const std::filesystem::path& root, const std::string& group) {
             {"last_time",sqlite3_column_int64(stats.statement,2)}};
 }
 
+std::optional<std::string> group_kind(const std::filesystem::path& root, const std::string& group) {
+    Database database(root);
+    Statement query(database,"SELECT kind FROM __group__ WHERE name=?");
+    query.text(1,group);
+    if(!query.next())return std::nullopt;
+    return query.text(0);
+}
+
 Json ordinary(const std::filesystem::path& root, const std::string& group) {
     Database index(root);
     const auto spec=group_spec(index,group);

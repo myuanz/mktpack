@@ -1,12 +1,16 @@
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
 import sqlite3
 import pyarrow as pa
 import mktpack
+import pytest
 from mktpack import raw
 
 
 def test_query_scales_and_empty_schema(tmp_path):
+    tmp_path = tmp_path / "行情"
+    tmp_path.mkdir()
     db = sqlite3.connect(tmp_path / "mkt.sqlite")
     db.executescript("""
         CREATE TABLE __group__(id INTEGER PRIMARY KEY, name TEXT UNIQUE, kind TEXT, schema TEXT,storage TEXT NOT NULL DEFAULT 'mkp',location TEXT NOT NULL DEFAULT '',table_name TEXT NOT NULL DEFAULT '',time_column TEXT NOT NULL DEFAULT 'time',symbol_column TEXT NOT NULL DEFAULT 'symbol_id');
@@ -24,12 +28,19 @@ def test_query_scales_and_empty_schema(tmp_path):
         raw.write(tmp_path / 'oi' / 'BTCUSDT' / path, table, metadata={"symbol": "BTCUSDT"})
         db.execute("INSERT INTO __timefile__(group_id,symbol_id,period,first_time,last_time,rows) VALUES (1,1,?,?,?,1)", (i, i, i))
     db.commit()
-    group = mktpack.open(tmp_path)["oi"]
+    dataset = mktpack.open(tmp_path)
+    assert dataset.root == str(tmp_path)
+    with pytest.raises(KeyError, match='missing'):
+        dataset['missing']
+    group = dataset["oi"]
     result = group.read(symbol="BTCUSDT")
     assert result["value"].type == pa.decimal128(38, 3)
     assert result["value"].to_pylist() == [Decimal("1.200"), Decimal("2.345")]
     assert group.read(symbol="BTCUSDT", start="2024-01-01").schema == result.schema
     assert group.read(columns=["value"]).column_names == ["value"]
+    assert group.read(start=19700101, end=date(1970, 1, 2)).equals(result)
+    assert group.read(symbols=["BTCUSDT"], start="1970-01-01T08:00:00.001+08:00",
+                      end=datetime(1970, 1, 1, 8, 0, 0, 2000, tzinfo=timezone(timedelta(hours=8)))).equals(result.slice(1))
 
     identifier = db.execute("SELECT id FROM __timefile__ WHERE period=1").fetchone()[0]
     volume = tmp_path / "absolute.data"

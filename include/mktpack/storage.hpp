@@ -5,6 +5,7 @@
 #include <optional>
 namespace mktpack {
 Json describe(const std::filesystem::path& root,const std::string& group="");
+std::optional<std::string> group_kind(const std::filesystem::path& root,const std::string& group);
 Json ordinary(const std::filesystem::path& root,const std::string& group);
 // Arrow 数组的列类型、有效性位图、数据缓冲区及嵌套子列。
 struct ResultColumn {

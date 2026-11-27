@@ -1,0 +1,36 @@
+from datetime import date, datetime
+from os import PathLike
+from typing import Any
+
+from pyarrow import Table
+
+from . import raw as raw
+
+type _Path = str | PathLike[str]
+type _Time = date | datetime | str | int
+
+class Group:
+    def __init__(self, root: _Path, name: str) -> None: ...
+    @property
+    def root(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    def describe(self) -> dict[str, Any]: ...
+    def read(
+        self,
+        *,
+        symbol: str | None = None,
+        symbols: list[str] | None = None,
+        start: _Time | None = None,
+        end: _Time | None = None,
+        columns: list[str] | None = None,
+    ) -> Table: ...
+
+class Dataset:
+    def __init__(self, root: _Path) -> None: ...
+    @property
+    def root(self) -> str: ...
+    def describe(self) -> list[dict[str, Any]]: ...
+    def __getitem__(self, name: str) -> Group | dict[str, Any] | list[dict[str, Any]]: ...
+
+def open(root: _Path) -> Dataset: ...
