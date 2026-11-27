@@ -55,13 +55,13 @@ int main(int argc, char** argv) {
     mktpack::PackageOptions package_options;
     packing->add_option("destination",destination)->required();
     packing->add_option("--max-file-size",maximum,"每个分卷的实际文件大小上限");
-    packing->add_option("--jobs",package_options.jobs,"并行处理年度分区的任务数（默认 4）")->check(CLI::PositiveNumber);
+    packing->add_option("--jobs",package_options.jobs,"并行裁剪重编码的任务数（默认 4）")->check(CLI::PositiveNumber);
     packing->add_option("--groups",package_options.groups)->expected(-1);
     packing->add_option("--symbols",package_options.symbols)->expected(-1);
     packing->add_option("--start",package_start);
     packing->add_option("--end",package_end);
     try {
-        app.parse(argc, argv);
+        app.parse(argc,app.ensure_utf8(argv));
         if (*info) {
             std::cout << mktpack::info(file).dump(2) << "\n";
         } else if (*download) {

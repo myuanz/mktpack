@@ -145,7 +145,8 @@ public:
         for(size_t i=0;i<counters.size();++i)
             result["counters"][counter_names[i]]=counters[i].load(std::memory_order_relaxed);
         if(!path.parent_path().empty())fs::create_directories(path.parent_path());
-        const auto temporary=fs::path(path.string()+".tmp");
+        auto temporary=path;
+        temporary+=".tmp";
         {std::ofstream output(temporary);output<<result.dump(2)<<'\n';if(!output)throw std::runtime_error("无法写入 profile："+path.string());}
         fs::remove(path);fs::rename(temporary,path);
         path.clear();
@@ -452,7 +453,7 @@ struct Source {fs::path path;std::string series;int day;};
 struct Stats {int64_t imported=0,skipped=0,blocks=0,rows=0;};
 
 std::string tick_volume(const std::string& symbol,int period) {
-    return (fs::path("tick")/symbol/(std::to_string(period)+".data")).string();
+    return (fs::path("tick")/symbol/(std::to_string(period)+".data")).generic_string();
 }
 
 int64_t volume_id(Database& db,const std::string& path);
@@ -781,7 +782,9 @@ class TickWriter {
             for(const auto& path:publishing) {
                 std::error_code ec;
                 fs::remove(path,ec);
-                fs::remove(path.string()+".tmp",ec);
+                auto temporary=path;
+                temporary+=".tmp";
+                fs::remove(temporary,ec);
             }
             throw;
         }
@@ -895,10 +898,12 @@ fs::path volume_file(const Database& db,const std::string& path) {
 }
 
 int64_t volume_id(Database& db,const std::string& path) {
-    Statement insert(db,"INSERT OR IGNORE INTO __volumes__(path) VALUES(?)");
+    Statement find(db,"SELECT id FROM __volumes__ WHERE path IN (?,?)");
+    find.text(1,path);find.text(2,fs::path(path).make_preferred().string());
+    if(find.next())return find.integer(0);
+    Statement insert(db,"INSERT INTO __volumes__(path) VALUES(?) RETURNING id");
     insert.text(1,path);insert.next();
-    Statement find(db,"SELECT id FROM __volumes__ WHERE path=?");
-    find.text(1,path);find.next();return find.integer(0);
+    return insert.integer(0);
 }
 
 void archive_month(Database& db,Profile& profile,const std::string& path,const std::vector<StoredDay>& days) {
@@ -961,7 +966,9 @@ void archive_year(Database& index,Profile& profile,const std::string& path,
                   const std::vector<StoredDay>& days,VolumeRefs& refs) {
     auto total=profile.scope(Stage::year_total);
     profile.count(Counter::year_days,days.size());
-    const auto destination=volume_file(index,path),temporary=fs::path(destination.string()+".tmp");
+    const auto destination=volume_file(index,path);
+    auto temporary=destination;
+    temporary+=".tmp";
     fs::create_directories(destination.parent_path());
     fs::remove(temporary);
     {

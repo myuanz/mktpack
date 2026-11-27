@@ -256,7 +256,8 @@ def test_historical_bulk_writes_directly_then_incremental_archives_month(tmp_pat
     assert sorted(folder.iterdir()) == expected
     with sqlite3.connect(root/'mkt.sqlite') as db:
         assert db.execute('SELECT path FROM __volumes__ ORDER BY path').fetchall() == [
-            (str(path.relative_to(root)),) for path in expected
+            (str(path.relative_to(root)) if path == month else path.relative_to(root).as_posix(),)
+            for path in expected
         ]
     if shared_month:
         with sqlite3.connect(month) as db:

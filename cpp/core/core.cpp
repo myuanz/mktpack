@@ -376,7 +376,8 @@ Table read(const std::filesystem::path& path) { return decode(load(path)); }
 
 void write(const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {
     if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
-    const auto temporary=path.string()+".tmp";
+    auto temporary=path;
+    temporary+=".tmp";
     {
         std::ofstream output(temporary,std::ios::binary);
         output.write((char*)bytes.data(),bytes.size());
