@@ -2,7 +2,7 @@
 
 ## 项目状态与依据
 
-MktPack 是金融时序数据格式与读写库，包名为 `mktpack`，CLI 为 `mkt`，文件扩展名为 `.mkp`。基础格式、数据集查询和币安下载已实现。开发前阅读 `实施计划.md`、`docs/需求.md` 和 `docs/规范.md`，README 保留用途与基本用法。
+MktPack 是金融时序数据格式与读写库，包名为 `mktpack`，CLI 为 `mkt`，文件扩展名为 `.mkp`。基础格式、数据集查询、币安下载、CTP 导入与增量分发已实现。开发前阅读 `docs/需求.md`，README 保留用途与基本用法。
 
 ## 模块组织
 
@@ -12,11 +12,11 @@ MktPack 是金融时序数据格式与读写库，包名为 `mktpack`，CLI 为 
 - `cpp/cli`：命令参数和终端进度；`cpp/bindings`、`python/mktpack`：薄绑定与 Arrow 包装
 - `tests`：自动测试；`validation`：只读真实样本和验收记录
 
-通用存储调用核心，适配器调用存储。所有 CLI 均由原生 C++ 执行，交接层以外的 C++ 不依赖 Python。Python 仅负责 wheel 分发、数据读取与 Arrow table 包装、raw 接口。
+通用存储调用核心，适配器调用存储。所有 CLI 均由原生 C++ 执行，交接层以外的 C++ 不依赖 Python。Python 侧保持薄绑定，暴露数据读取、Arrow table 包装、raw 接口以及数据集维护与 port 能力。
 开发阶段直接修改接口，不保留兼容转发或旧入口别名。
-MKP 时序、SQLite 时序、SQLite 普通表按组描述读写，具体间实施计划；
+MKP 时序、SQLite 时序、SQLite 普通表按组描述读写，具体见 `docs/需求.md`；
 
-core、storage、package 相关逻辑不应被 port 业务侵入
+读取与校验层不应被 port 业务侵入；打包、写入与归档可依据 `__meta__['port']` 决定冷热分卷策略。
 
 ## 构建与开发命令
 
