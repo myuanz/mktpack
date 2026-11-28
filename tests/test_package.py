@@ -171,8 +171,8 @@ def test_package_volumes_repack_and_index_path(source, tmp_path):
     assert all(p.read_bytes() == data for p, data in before.items())
     index_before = (destination / 'mkt.sqlite').read_bytes()
     download = subprocess.run([shutil.which('mkt'), '--root', str(destination), 'binance', 'download',
-                               '--symbols', 'BTCUSDT', '--groups', 'kline'], capture_output=True, text=True, encoding='utf-8')
-    assert download.returncode == 1 and '不支持下载写入' in download.stderr
+                               '--symbols', 'BTCUSDT', '--groups', 'funding_rate_settlement'], capture_output=True, text=True, encoding='utf-8')
+    assert download.returncode == 1 and '暂不支持向打包数据集写入 SQLite 时序组' in download.stderr
     assert (destination / 'mkt.sqlite').read_bytes() == index_before
 
 
@@ -272,8 +272,8 @@ def test_size_boundary_rejection_and_index_warning(source, tmp_path):
     assert mktpack.open(empty)['exchangeinfo'] == mktpack.open(root)['exchangeinfo']
     check_package(empty)
     download = subprocess.run([shutil.which('mkt'), '--root', str(empty), 'binance', 'download',
-                               '--symbols', 'BTCUSDT', '--groups', 'kline'], capture_output=True, text=True, encoding='utf-8')
-    assert download.returncode == 1 and '不支持下载写入' in download.stderr
+                               '--symbols', 'BTCUSDT', '--groups', 'funding_rate_settlement'], capture_output=True, text=True, encoding='utf-8')
+    assert download.returncode == 1 and '暂不支持向打包数据集写入 SQLite 时序组' in download.stderr
 
 
 @pytest.mark.parametrize('jobs', [1, 4])

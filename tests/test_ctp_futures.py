@@ -96,8 +96,7 @@ def test_subset_incremental_tick_import_and_archive(tmp_path):
     packed = tmp_path/'packed'
     cli(root, 'package', packed)
     assert mktpack.open(packed)['tick'].read(symbol='AP2505', columns=columns).equals(table)
-    with pytest.raises(subprocess.CalledProcessError, match='non-zero'):
-        cli(packed, 'ctp-futures', 'import', mirror)
+    assert cli(packed, 'ctp-futures', 'import', mirror)['skipped'] == 1
 
 
 def test_retry_after_bad_source(tmp_path):

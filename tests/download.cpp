@@ -325,5 +325,34 @@ int main() {
         expect(list(prefix,true)==std::vector<std::string>({prefix+"AUSDT/",prefix+"BUSDT/"}),"品种目录分页错误");
         expect(url_encode("币/USDT",true)=="%E5%B8%81/USDT","非ASCII品种路径未转义");
     }
+    {
+        // 打包数据集直接通过 PayloadStore 写入热卷 hot.data，并支持月包覆盖与合年
+        const auto packed=root/"packed-download";
+        fs::create_directories(packed);
+        {
+            storage::Database init(packed/"mkt.sqlite",SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
+            storage::create_index(init);
+            init.exec("PRAGMA application_id=0x4d4b5450");
+        }
+        Options p; p.root=packed; p.groups={"kline"}; p.symbols={"BTCUSDT"};
+        p.start=timestamp("2024-01-01"); p.end=timestamp("2024-02-01"); p.jobs=1;
+        responses[host+"?list-type=2&prefix="+daily]=listing({day});
+        responses[host+"?list-type=2&prefix="+monthly]=listing({});
+        responses[host+day]=zipped("1704067200000,1,3,1,2,10,0,0,0,4,0,0\n");
+        download(p);
+        expect(fs::exists(packed/"hot.data.1"),"打包数据集下载未生成 hot.data.1");
+        expect(!fs::exists(packed/"kline/BTCUSDT/2024.mkp"),"打包数据集不应写出松散 mkp");
+        expect(mktpack::check_dataset(packed)["errors"].empty(),"打包数据集热卷校验失败");
+        expect(mktpack::describe(packed,"kline","BTCUSDT")["rows"]==1,"打包数据集热卷行数错误");
+        responses[host+"?list-type=2&prefix="+monthly]=listing({month});
+        responses[host+month]=zipped("1704067200000,1.1,3.1,1.1,2.1,10.1,0,0,0,4.1,0,0\n1704153600000,2.1,4.1,2.1,3.1,12.1,0,0,0,5.1,0,0\n");
+        download(p);
+        expect(mktpack::describe(packed,"kline","BTCUSDT")["rows"]==2,"打包数据集月包覆盖失败");
+        expect(mktpack::check_dataset(packed)["errors"].empty(),"打包数据集覆盖后校验失败");
+        const auto before_packed=requests;
+        p.full=true;
+        download(p);
+        expect(requests>=before_packed && mktpack::describe(packed,"kline","BTCUSDT")["rows"]==2,"打包数据集全量核验失败");
+    }
     fs::remove_all(root);
 }
