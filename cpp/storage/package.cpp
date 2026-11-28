@@ -1,5 +1,6 @@
 #include <mktpack/storage.hpp>
 #include "sqlite.hpp"
+#include "store.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -128,14 +129,9 @@ public:
     }
 };
 
-uint64_t database_size(Database& db) {
-    Statement pages(db,"PRAGMA page_count"), size(db,"PRAGMA page_size");
-    pages.next(); size.next();
-    return uint64_t(pages.integer(0))*uint64_t(size.integer(0));
-}
-
 class Volumes {
     fs::path root;
+    std::string prefix;
     uint64_t limit;
     std::unique_ptr<Database> current;
     std::optional<Statement> blob_insert;
@@ -143,13 +139,14 @@ class Volumes {
 public:
     size_t count=0;
     uint64_t bytes=0;
-    Volumes(fs::path directory,uint64_t maximum):root(std::move(directory)),limit(maximum) {}
-    std::string path(int64_t id) const { return "mkt.data."+std::to_string(id); }
+    Volumes(fs::path directory,uint64_t maximum,std::string name_prefix="mkt.data.")
+        :root(std::move(directory)),prefix(std::move(name_prefix)),limit(maximum) {}
+    std::string path(int64_t id) const { return prefix+std::to_string(id); }
     void close() {
         if (!current) return;
         blob_insert.reset();
         current->exec("COMMIT");
-        bytes+=database_size(*current);
+        bytes+=sqlite_file_size(*current);
         current.reset();
     }
     int64_t append_entry(const std::string& label,const std::function<void(Database&)>& write) {
@@ -162,7 +159,7 @@ public:
             }
             current->exec("SAVEPOINT entry");
             write(*current);
-            const auto size=database_size(*current);
+            const auto size=sqlite_file_size(*current);
             if (size<=limit) {
                 current->exec("RELEASE entry");
                 ++entries;
@@ -186,20 +183,8 @@ public:
     }
 };
 
-void copy_index(Database& source,Database& destination) {
-    destination.exec("PRAGMA journal_mode=MEMORY");
-    auto* backup=sqlite3_backup_init(destination.db,"main",source.db,"main");
-    if (!backup) throw std::runtime_error(sqlite3_errmsg(destination.db));
-    const auto status=sqlite3_backup_step(backup,-1);
-    const auto finish=sqlite3_backup_finish(backup);
-    if (status!=SQLITE_DONE || finish!=SQLITE_OK)
-        throw std::runtime_error("索引复制失败："+std::string(sqlite3_errmsg(destination.db)));
-    destination.exec("PRAGMA journal_mode=MEMORY");
-}
-
-void register_volume(Database& db,const Volumes& volumes,int64_t id) {
-    Statement insert(db,"INSERT OR IGNORE INTO __volumes__(id,path) VALUES(?,?)");
-    insert.integer(1,id);insert.text(2,volumes.path(id));insert.next();
+int64_t register_volume(Database& db,const Volumes& volumes,int64_t id) {
+    return ensure_volume(db,volumes.path(id));
 }
 
 struct MkpStats {
@@ -228,11 +213,10 @@ void relocate_volume(Database& output,int64_t volume,std::span<const int64_t> id
     }
 }
 
-MkpStats relocate_mkp(Database& output,Volumes& volumes,PackagePayloads& payloads,
-                      const PackageFiles& plan,const PackageOptions& options) {
+MkpStats relocate_mkp(Database& output,Volumes& volumes,Volumes& hot_volumes,int64_t hot_from,
+                      PackagePayloads& payloads,const PackageFiles& plan,const PackageOptions& options) {
     MkpStats stats;
-    int64_t active_volume=0;
-    std::vector<int64_t> ids;
+    std::map<int64_t,std::vector<int64_t>> by_volume;
     for(const auto& file:plan.entries) {
         auto bytes=payloads.take();
         if(bytes.empty()) {
@@ -241,30 +225,25 @@ MkpStats relocate_mkp(Database& output,Volumes& volumes,PackagePayloads& payload
             continue;
         }
         const auto path=plan.path(file);
-        const auto volume=volumes.append(file.id,bytes,path);
-        if(volume!=active_volume) {
-            relocate_volume(output,active_volume,ids);
-            ids.clear();
-            register_volume(output,volumes,volume);
-            active_volume=volume;
-        }
-        ids.push_back(file.id);
+        auto& target=file.last>=hot_from?hot_volumes:volumes;
+        const auto local_id=target.append(file.id,bytes,path);
+        const auto volume=register_volume(output,target,local_id);
+        by_volume[volume].push_back(file.id);
         stats.rows+=file.rows;
         ++stats.copied;
-        report_mkp(options,path,volumes,volume,true,stats.files(),plan.entries.size());
+        report_mkp(options,path,target,local_id,true,stats.files(),plan.entries.size());
     }
-    relocate_volume(output,active_volume,ids);
+    for(const auto& [volume,ids]:by_volume) relocate_volume(output,volume,ids);
     return stats;
 }
 
-MkpStats pack_selected_mkp(Database& input,Database& output,Volumes& volumes,PackagePayloads& payloads,
-                           const PackageFiles& plan,const PackageOptions& options) {
+MkpStats pack_selected_mkp(Database& input,Database& output,Volumes& volumes,Volumes& hot_volumes,int64_t hot_from,
+                           PackagePayloads& payloads,const PackageFiles& plan,const PackageOptions& options) {
     MkpStats stats;
     const auto& files=plan.entries;
     struct GroupSchema {Json original,output;};
     std::map<int64_t,GroupSchema> schemas;
     Statement insert(output,"INSERT INTO __timefile__(id,group_id,symbol_id,period,first_time,last_time,rows,volume_id) VALUES(?,?,?,?,?,?,?,?)");
-    int64_t active_volume=0;
     struct Pending {
         size_t index;
         bool copy;
@@ -297,13 +276,12 @@ MkpStats pack_selected_mkp(Database& input,Database& output,Volumes& volumes,Pac
         if(bytes.empty()) continue;
         const auto header=info(bytes);
         const auto path=plan.path(file);
-        const auto volume=volumes.append(file.id,bytes,path);
-        if(volume!=active_volume) {
-            register_volume(output,volumes,volume);
-            active_volume=volume;
-        }
+        const int64_t last_time=header.at("last_time");
+        auto& target=last_time>=hot_from?hot_volumes:volumes;
+        const auto local_id=target.append(file.id,bytes,path);
+        const auto volume=register_volume(output,target,local_id);
         insert.integer(1,file.id);insert.integer(2,file.group);insert.integer(3,file.symbol);
-        insert.integer(4,file.period);insert.integer(5,header.at("first_time"));insert.integer(6,header.at("last_time"));
+        insert.integer(4,file.period);insert.integer(5,header.at("first_time"));insert.integer(6,last_time);
         insert.integer(7,header.at("rows"));insert.integer(8,volume);insert.next();
         sqlite3_reset(insert.statement);
         auto [schema_position,new_group]=schemas.try_emplace(file.group);
@@ -325,7 +303,7 @@ MkpStats pack_selected_mkp(Database& input,Database& output,Volumes& volumes,Pac
         stats.rows+=header.at("rows").get<int64_t>();
         if(item.copy)++stats.copied;
         else ++stats.reencoded;
-        report_mkp(options,path,volumes,volume,item.copy,stats.files(),files.size());
+        report_mkp(options,path,target,local_id,item.copy,stats.files(),files.size());
     }
     for(const auto& [group,schema]:schemas) {
         Statement update(output,"UPDATE __group__ SET schema=? WHERE id=?");
@@ -406,7 +384,7 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
         PackagePayloads payloads(input.root,plan,full_range);
         std::optional<Database> output_db(std::in_place,work/"mkt.sqlite",SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
         auto& output=*output_db;
-        copy_index(input,output);
+        copy_sqlite_file(input,output);
         if(!relocate)output.exec("DELETE FROM __timefile__");
         output.exec("DELETE FROM __volumes__;DELETE FROM __sqlite_partitions__;PRAGMA application_id=0x4d4b5450");
         for(const auto& group:excluded) {
@@ -419,14 +397,20 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
             const auto location=ordinary.text(0);
             fs::create_directories((work/location).parent_path());
             Database src(input.root/location),dst(work/location,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
-            copy_index(src,dst);ordinary_bytes+=database_size(dst);
+            copy_sqlite_file(src,dst);ordinary_bytes+=sqlite_file_size(dst);
         }
 
-        Volumes volumes(work,options.max_file_size);
+        const auto port=meta_get(input,"port").value_or("");
+        const int64_t hot_from=port=="binance"?current_year_start_ms():INT64_MAX;
+        meta_set(output,"max_file_size",std::to_string(options.max_file_size));
+        ensure_default_version(output);
+
+        Volumes volumes(work,options.max_file_size,"mkt.data.");
+        Volumes hot_volumes(work,options.max_file_size,"hot.data.");
         int64_t sqlite_rows=0;
         output.exec("BEGIN");
-        const auto mkp=relocate?relocate_mkp(output,volumes,payloads,plan,options)
-                               :pack_selected_mkp(input,output,volumes,payloads,plan,options);
+        const auto mkp=relocate?relocate_mkp(output,volumes,hot_volumes,hot_from,payloads,plan,options)
+                               :pack_selected_mkp(input,output,volumes,hot_volumes,hot_from,payloads,plan,options);
 
         for(const auto& name:selected) {
             const auto spec=group_spec(input,name);
@@ -449,8 +433,8 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
                 const auto records=reader.read(std::max(start,options.start),std::min(end,options.end),spec.symbol.empty()?std::vector<std::string>{}:options.symbols);
                 if(records.rows.empty()) continue;
                 char label[8];snprintf(label,sizeof label,"%04d-%02u",int(month.year()),unsigned(month.month()));
-                const auto volume=volumes.append_entry(name+" "+label+" 的整月数据",[&](Database& db){copy_rows(db,destination_spec,create,records);});
-                register_volume(output,volumes,volume);
+                const auto local_id=volumes.append_entry(name+" "+label+" 的整月数据",[&](Database& db){copy_rows(db,destination_spec,create,records);});
+                const auto volume=register_volume(output,volumes,local_id);
                 const auto column=std::find(records.columns.begin(),records.columns.end(),spec.time)-records.columns.begin();
                 int64_t minimum=INT64_MAX,maximum=INT64_MIN;
                 for(const auto& row:records.rows){minimum=std::min(minimum,row[column].get<int64_t>());maximum=std::max(maximum,row[column].get<int64_t>());}
@@ -462,11 +446,13 @@ Json package(const fs::path& source,const fs::path& destination,const PackageOpt
         }
         output.exec("COMMIT;VACUUM");
         volumes.close();
-        const auto index_size=database_size(output);
+        hot_volumes.close();
+        const auto index_size=sqlite_file_size(output);
         if(index_size>options.max_file_size)result["warnings"].push_back("mkt.sqlite 为 "+std::to_string(index_size)+" 字节，超过分卷上限 "+std::to_string(options.max_file_size));
         result["files"]=mkp.files();result["rows"]=mkp.rows+sqlite_rows;result["sqlite_rows"]=sqlite_rows;
         result["copied"]=mkp.copied;result["reencoded"]=mkp.reencoded;
-        result["volumes"]=volumes.count;result["index_bytes"]=index_size;result["bytes"]=index_size+volumes.bytes+ordinary_bytes;
+        result["volumes"]=volumes.count;result["hot_volumes"]=hot_volumes.count;
+        result["index_bytes"]=index_size;result["bytes"]=index_size+volumes.bytes+hot_volumes.bytes+ordinary_bytes;
         output_db.reset();
         for(const auto& entry:fs::directory_iterator(work))fs::rename(entry.path(),destination/entry.path().filename());
         fs::remove(work);

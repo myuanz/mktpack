@@ -4,8 +4,17 @@
 #include <filesystem>
 #include <map>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 namespace mktpack {
+inline std::string utf8_string(const std::filesystem::path& path) {
+    const auto u8=path.u8string();
+    return std::string(reinterpret_cast<const char*>(u8.data()),u8.size());
+}
+inline std::filesystem::path utf8_path(std::string_view text) {
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()),text.size()));
+}
 using Json=nlohmann::json;
 using Columns=std::map<std::string,std::vector<int64_t>>;
 struct Table { Columns columns; Json schema=Json::object(); Json metadata=Json::object(); };

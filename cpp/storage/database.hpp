@@ -12,8 +12,8 @@ struct Database {
     explicit Database(std::filesystem::path location, int flags=SQLITE_OPEN_READONLY) {
         path=std::filesystem::is_directory(location)?location/"mkt.sqlite":location;
         root=path.parent_path();
-        const auto filename=path.u8string();
-        if (sqlite3_open_v2(reinterpret_cast<const char*>(filename.c_str()),&db,flags,nullptr)!=SQLITE_OK) {
+        const auto filename=utf8_string(path);
+        if (sqlite3_open_v2(filename.c_str(),&db,flags,nullptr)!=SQLITE_OK) {
             const std::string error=sqlite3_errmsg(db);
             sqlite3_close(db);
             throw std::runtime_error("无法打开索引："+path.string()+"："+error);
@@ -64,7 +64,8 @@ inline std::string identifier(const std::string& name) {
 }
 
 inline void create_index(Database& db) {
-    db.exec("CREATE TABLE IF NOT EXISTS __group__(id INTEGER PRIMARY KEY,name TEXT UNIQUE,kind TEXT,schema TEXT NOT NULL DEFAULT '{}',"
+    db.exec("CREATE TABLE IF NOT EXISTS __meta__(key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;"
+            "CREATE TABLE IF NOT EXISTS __group__(id INTEGER PRIMARY KEY,name TEXT UNIQUE,kind TEXT,schema TEXT NOT NULL DEFAULT '{}',"
             "storage TEXT NOT NULL DEFAULT 'mkp',location TEXT NOT NULL DEFAULT '',table_name TEXT NOT NULL DEFAULT '',"
             "time_column TEXT NOT NULL DEFAULT 'time',symbol_column TEXT NOT NULL DEFAULT 'symbol_id');"
             "CREATE TABLE IF NOT EXISTS __symbols__(id INTEGER PRIMARY KEY,name TEXT UNIQUE);"

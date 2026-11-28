@@ -96,12 +96,26 @@ QueryResult query(const std::filesystem::path& root, const std::string& group,
                   const Projection& requested = {});
 QueryResult file_result(const std::filesystem::path& path);
 Json check_dataset(const std::filesystem::path& root);
+inline constexpr uint64_t default_max_file_size=8ULL*1024*1024*1024;
 struct PackageOptions {
     std::vector<std::string> groups, symbols;
     int64_t start=std::numeric_limits<int64_t>::min(), end=std::numeric_limits<int64_t>::max();
-    uint64_t max_file_size=128ULL*1024*1024;
+    uint64_t max_file_size=default_max_file_size;
     size_t jobs=4;
     std::function<void(const std::string&)> progress;
 };
 Json package(const std::filesystem::path& source,const std::filesystem::path& destination,const PackageOptions& options={});
+Json dataset_meta(const std::filesystem::path& root);
+void set_dataset_meta(const std::filesystem::path& root,const std::string& key,const std::string& value);
+struct MergeOptions {
+    std::vector<std::string> groups, symbols;
+    std::function<void(const std::string&)> progress;
+};
+Json merge_dataset(const std::filesystem::path& target,const std::filesystem::path& source,const MergeOptions& options={});
+struct CompactOptions {
+    uint64_t max_file_size=0;
+    std::optional<int64_t> before;
+    std::function<void(const std::string&)> progress;
+};
+Json compact(const std::filesystem::path& root,const CompactOptions& options={});
 }
