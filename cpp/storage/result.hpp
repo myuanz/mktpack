@@ -2,12 +2,22 @@
 #include "sqlite.hpp"
 
 namespace mktpack::storage {
-double scale_divisor(int scale);
-ResultColumn make_column(const std::string& type, size_t rows, bool zero_init = false);
-void append_string(ResultColumn& out, const void* data, size_t length);
+struct TargetSlot {
+    size_t column_index;
+    bool as_real;
+};
 
-QueryResult mkp_result(std::vector<Table> tables, const Json& empty_schema,
-                       std::vector<std::string> names);
+struct MkpOutput {
+    QueryResult result;
+    std::vector<size_t> symbol_columns;
+    std::vector<std::pair<std::string, std::vector<TargetSlot>>> targets;
+
+    void set_symbols(std::span<const std::pair<std::string, size_t>> symbol_runs);
+    void write_slice(const Table& table, size_t slice_first, size_t slice_rows, size_t dst_offset);
+};
+
+MkpOutput init_mkp_output(const Json& schema, std::vector<std::string> names, size_t total_rows);
+QueryResult single_file_result(const Table& table, const Json& schema, std::vector<std::string> names);
 QueryResult sql_result(SqlReader& reader, Database& index, const std::vector<std::string>& symbols,
                        int64_t start, int64_t end, std::vector<std::string> names);
 }

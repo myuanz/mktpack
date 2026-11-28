@@ -3,7 +3,6 @@
 #include <cmath>
 #include <cstring>
 #include <map>
-#include <queue>
 #include <set>
 #include <unordered_map>
 
@@ -14,12 +13,53 @@ constexpr double kPow10[23] = {
     1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
 };
 
+double scale_divisor(int scale) {
+    if (scale >= 0 && scale <= 22) return kPow10[scale];
+    return std::pow(10.0, scale);
+}
+
 template<class T> void append_value(EmptyBuffer& buffer, T value) {
     buffer.append(&value, sizeof(T));
 }
 
 std::string decimal_as_real(const std::string& schema_type) {
     return schema_type == "decimal" ? "real" : schema_type;
+}
+
+ResultColumn make_column(const std::string& type, size_t rows, bool preallocate_fixed) {
+    const auto kind = decimal_as_real(type);
+    ResultColumn out{kind, 0, rows, {}, {}};
+    auto& buffers = out.buffers;
+    if (kind == "null") {
+        buffers.resize(1);
+    } else if (kind == "dictionary") {
+        buffers.resize(2);
+        if (preallocate_fixed) buffers[1].resize_for_overwrite(rows * sizeof(int32_t));
+        else buffers[1].reserve(rows * sizeof(int32_t));
+        out.children.push_back(make_column("string", 0, false));
+    } else if (kind == "any") {
+        buffers.resize(3);
+        buffers[1].reserve(rows);
+        buffers[2].reserve(rows * sizeof(int32_t));
+        for (auto name : {"null", "integer", "real", "string", "blob"})
+            out.children.push_back(make_column(name, 0, false));
+    } else if (kind == "string" || kind == "blob") {
+        buffers.resize(3);
+        buffers[1].reserve((rows + 1) * sizeof(int32_t));
+        append_value(buffers[1], int32_t(0));
+    } else {
+        buffers.resize(2);
+        if (preallocate_fixed) buffers[1].resize_for_overwrite(rows * 8);
+        else buffers[1].reserve(rows * 8);
+    }
+    return out;
+}
+
+void append_string(ResultColumn& out, const void* data, size_t length) {
+    auto& bytes = out.buffers[2];
+    if (length > size_t(INT32_MAX) - bytes.size()) throw std::runtime_error("Arrow 字符串数据超过 2 GiB");
+    if (length) bytes.append(data, length);
+    append_value(out.buffers[1], static_cast<int32_t>(bytes.size()));
 }
 
 int union_child(const Json& value) {
@@ -74,186 +114,94 @@ void append_sql_value(ResultColumn& out, size_t row, const Json& value, int scal
         append_value(out.buffers[1], value.is_null() ? int64_t(0) : value.get<int64_t>());
     }
 }
-
-struct Position { uint32_t table, row; };
-
-// 仅在同一合约内部出现时间重叠块时按时间稳定归并。
-std::vector<Position> ordered_span(const std::vector<Table>& tables, size_t begin, size_t end, size_t span_rows) {
-    bool sorted = true;
-    int64_t last = INT64_MIN;
-    for (size_t i = begin; i < end; ++i) {
-        const auto& time = tables[i].columns.at("time");
-        if (time.empty()) continue;
-        sorted &= time.front() >= last;
-        last = time.back();
-    }
-    if (sorted) return {};
-    std::vector<const std::vector<int64_t>*> clocks;
-    clocks.reserve(end - begin);
-    for (size_t i = begin; i < end; ++i) clocks.push_back(&tables[i].columns.at("time"));
-    const auto later = [&](Position a, Position b) {
-        const auto ta = (*clocks[a.table - begin])[a.row], tb = (*clocks[b.table - begin])[b.row];
-        return ta == tb ? a.table > b.table : ta > tb;
-    };
-    std::priority_queue<Position, std::vector<Position>, decltype(later)> next(later);
-    for (size_t i = begin; i < end; ++i)
-        if (!clocks[i - begin]->empty()) next.push({static_cast<uint32_t>(i), 0});
-    std::vector<Position> order;
-    order.reserve(span_rows);
-    while (!next.empty()) {
-        auto pos = next.top();
-        next.pop();
-        const auto length = static_cast<uint32_t>(clocks[pos.table - begin]->size());
-        do {
-            order.push_back(pos);
-            ++pos.row;
-        } while (pos.row < length && (next.empty() || !later(pos, next.top())));
-        if (pos.row < length) next.push(pos);
-    }
-    return order;
-}
 }
 
-double scale_divisor(int scale) {
-    if (scale >= 0 && scale <= 22) return kPow10[scale];
-    return std::pow(10.0, scale);
-}
-
-ResultColumn make_column(const std::string& type, size_t rows, bool preallocate_fixed) {
-    const auto kind = decimal_as_real(type);
-    ResultColumn out{kind, 0, rows, {}, {}};
-    auto& buffers = out.buffers;
-    if (kind == "null") {
-        buffers.resize(1);
-    } else if (kind == "dictionary") {
-        buffers.resize(2);
-        if (preallocate_fixed) buffers[1].resize_for_overwrite(rows * sizeof(int32_t));
-        else buffers[1].reserve(rows * sizeof(int32_t));
-        out.children.push_back(make_column("string", 0, false));
-    } else if (kind == "any") {
-        buffers.resize(3);
-        buffers[1].reserve(rows);
-        buffers[2].reserve(rows * sizeof(int32_t));
-        for (auto name : {"null", "integer", "real", "string", "blob"})
-            out.children.push_back(make_column(name, 0, false));
-    } else if (kind == "string" || kind == "blob") {
-        buffers.resize(3);
-        buffers[1].reserve((rows + 1) * sizeof(int32_t));
-        append_value(buffers[1], int32_t(0));
-    } else {
-        buffers.resize(2);
-        if (preallocate_fixed) buffers[1].resize_for_overwrite(rows * 8);
-        else buffers[1].reserve(rows * 8);
+MkpOutput init_mkp_output(const Json& schema, std::vector<std::string> names, size_t total_rows) {
+    MkpOutput out{{total_rows, std::move(names), {}}, {}, {}};
+    out.result.columns.reserve(out.result.names.size());
+    std::map<std::string, std::vector<TargetSlot>> target_map;
+    for (size_t c = 0; c < out.result.names.size(); ++c) {
+        const auto& name = out.result.names[c];
+        if (name == "symbol") {
+            out.symbol_columns.push_back(c);
+            out.result.columns.push_back(make_column("dictionary", total_rows, true));
+            continue;
+        }
+        const auto kind = decimal_as_real(schema.at(name).at("type").get<std::string>());
+        out.result.columns.push_back(make_column(kind, total_rows, true));
+        target_map[name].push_back({c, kind == "real"});
     }
+    out.targets.assign(target_map.begin(), target_map.end());
     return out;
 }
 
-void append_string(ResultColumn& out, const void* data, size_t length) {
-    auto& bytes = out.buffers[2];
-    if (length > size_t(INT32_MAX) - bytes.size()) throw std::runtime_error("Arrow 字符串数据超过 2 GiB");
-    if (length) bytes.append(data, length);
-    append_value(out.buffers[1], static_cast<int32_t>(bytes.size()));
+void MkpOutput::set_symbols(std::span<const std::pair<std::string, size_t>> symbol_runs) {
+    if (symbol_columns.empty() || !result.rows) return;
+    auto& primary = result.columns[symbol_columns[0]];
+    auto& dict = primary.children[0];
+    auto* indices = reinterpret_cast<int32_t*>(primary.buffers[1].data());
+    size_t offset = 0;
+    for (const auto& [sym, count] : symbol_runs) {
+        if (!count) continue;
+        const auto code = static_cast<int32_t>(dict.rows++);
+        append_string(dict, sym.data(), sym.size());
+        std::fill_n(indices + offset, count, code);
+        offset += count;
+    }
+    for (size_t k = 1; k < symbol_columns.size(); ++k) {
+        auto& copy = result.columns[symbol_columns[k]];
+        std::memcpy(copy.buffers[1].data(), primary.buffers[1].data(), primary.buffers[1].size());
+        auto& dst_dict = copy.children[0];
+        dst_dict.rows = dict.rows;
+        dst_dict.buffers[1].resize_for_overwrite(dict.buffers[1].size());
+        if (!dict.buffers[1].empty())
+            std::memcpy(dst_dict.buffers[1].data(), dict.buffers[1].data(), dict.buffers[1].size());
+        dst_dict.buffers[2].resize_for_overwrite(dict.buffers[2].size());
+        if (!dict.buffers[2].empty())
+            std::memcpy(dst_dict.buffers[2].data(), dict.buffers[2].data(), dict.buffers[2].size());
+    }
 }
 
-QueryResult mkp_result(std::vector<Table> tables, const Json& empty_schema,
-                       std::vector<std::string> names) {
-    // 确保按 (symbol, time) 稳定分块排列
-    std::stable_sort(tables.begin(), tables.end(), [](const Table& a, const Table& b) {
-        return a.metadata.value("symbol", "") < b.metadata.value("symbol", "");
-    });
-
-    QueryResult result{0, std::move(names), {}};
-    for (const auto& table : tables) result.rows += table.columns.at("time").size();
-
-    struct Span {
-        size_t begin, end, rows;
-        std::string symbol;
-        std::vector<Position> order;
-    };
-    std::vector<Span> spans;
-    for (size_t i = 0; i < tables.size();) {
-        const std::string sym = tables[i].metadata.value("symbol", "");
-        size_t j = i;
-        size_t span_rows = 0;
-        for (; j < tables.size() && tables[j].metadata.value("symbol", "") == sym; ++j)
-            span_rows += tables[j].columns.at("time").size();
-        if (span_rows > 0) {
-            auto order = ordered_span(tables, i, j, span_rows);
-            spans.push_back({i, j, span_rows, sym, std::move(order)});
-        }
-        i = j;
-    }
-
-    for (const auto& name : result.names) {
-        if (name == "symbol") {
-            auto out = make_column("dictionary", result.rows, true);
-            auto& dict = out.children[0];
-            auto* indices = reinterpret_cast<int32_t*>(out.buffers[1].data());
-            size_t offset = 0;
-            for (const auto& span : spans) {
-                const auto code = static_cast<int32_t>(dict.rows++);
-                append_string(dict, span.symbol.data(), span.symbol.size());
-                std::fill_n(indices + offset, span.rows, code);
-                offset += span.rows;
+void MkpOutput::write_slice(const Table& table, size_t slice_first, size_t slice_rows, size_t dst_offset) {
+    if (!slice_rows) return;
+    for (const auto& [name, slots] : targets) {
+        const int64_t* src = table.columns.at(name).data() + slice_first;
+        const int sc = table.schema.at(name).value("scale", 0);
+        for (size_t s = 0; s < slots.size(); ++s) {
+            const auto& slot = slots[s];
+            uint8_t* raw_dst = result.columns[slot.column_index].buffers[1].data();
+            if (s > 0 && slot.as_real == slots[0].as_real) {
+                const uint8_t* first_dst = result.columns[slots[0].column_index].buffers[1].data();
+                std::memcpy(raw_dst + dst_offset * 8, first_dst + dst_offset * 8, slice_rows * 8);
+                continue;
             }
-            result.columns.push_back(std::move(out));
-            continue;
-        }
-        const auto& spec = tables.empty() ? empty_schema.at(name) : tables.front().schema.at(name);
-        auto kind = decimal_as_real(spec.at("type").get<std::string>());
-        for (const auto& t : tables) {
-            if (decimal_as_real(t.schema.at(name).at("type").get<std::string>()) == "real") kind = "real";
-        }
-        auto out = make_column(kind, result.rows, true);
-        uint8_t* raw_dst = out.buffers[1].data();
-        std::vector<const int64_t*> sources(tables.size());
-        std::vector<int> scales(tables.size(), 0);
-        for (size_t i = 0; i < tables.size(); ++i) {
-            sources[i] = tables[i].columns.at(name).data();
-            scales[i] = tables[i].schema.at(name).value("scale", 0);
-        }
-        size_t offset = 0;
-        for (const auto& span : spans) {
-            if (span.order.empty()) {
-                for (size_t i = span.begin; i < span.end; ++i) {
-                    const size_t n = tables[i].columns.at(name).size();
-                    if (!n) continue;
-                    const int64_t* src = sources[i];
-                    if (kind == "real") {
-                        double* dst = reinterpret_cast<double*>(raw_dst) + offset;
-                        const int sc = scales[i];
-                        if (sc == 0) {
-                            for (size_t r = 0; r < n; ++r) dst[r] = static_cast<double>(src[r]);
-                        } else {
-                            const double div = scale_divisor(sc);
-                            for (size_t r = 0; r < n; ++r) dst[r] = static_cast<double>(src[r]) / div;
-                        }
-                    } else {
-                        std::memcpy(raw_dst + offset * sizeof(int64_t), src, n * sizeof(int64_t));
-                    }
-                    offset += n;
+            if (slot.as_real) {
+                double* dst = reinterpret_cast<double*>(raw_dst) + dst_offset;
+                if (sc == 0) {
+                    for (size_t r = 0; r < slice_rows; ++r) dst[r] = static_cast<double>(src[r]);
+                } else {
+                    const double div = scale_divisor(sc);
+                    for (size_t r = 0; r < slice_rows; ++r) dst[r] = static_cast<double>(src[r]) / div;
                 }
-            } else if (kind == "real") {
-                double* dst = reinterpret_cast<double*>(raw_dst) + offset;
-                for (size_t r = 0; r < span.order.size(); ++r) {
-                    const auto pos = span.order[r];
-                    const int sc = scales[pos.table];
-                    const auto v = sources[pos.table][pos.row];
-                    dst[r] = sc == 0 ? static_cast<double>(v) : static_cast<double>(v) / scale_divisor(sc);
-                }
-                offset += span.order.size();
+            } else if (sc == 0) {
+                std::memcpy(raw_dst + dst_offset * sizeof(int64_t), src, slice_rows * sizeof(int64_t));
             } else {
-                int64_t* dst = reinterpret_cast<int64_t*>(raw_dst) + offset;
-                for (size_t r = 0; r < span.order.size(); ++r) {
-                    const auto pos = span.order[r];
-                    dst[r] = sources[pos.table][pos.row];
-                }
-                offset += span.order.size();
+                int64_t* dst = reinterpret_cast<int64_t*>(raw_dst) + dst_offset;
+                for (size_t r = 0; r < slice_rows; ++r) dst[r] = rescale(src[r], sc, 0);
             }
         }
-        result.columns.push_back(std::move(out));
     }
-    return result;
+}
+
+QueryResult single_file_result(const Table& table, const Json& schema, std::vector<std::string> names) {
+    const size_t rows = table.columns.at("time").size();
+    auto out = init_mkp_output(schema, std::move(names), rows);
+    if (rows) {
+        const std::pair<std::string, size_t> run{table.metadata.value("symbol", ""), rows};
+        out.set_symbols(std::span(&run, 1));
+        out.write_slice(table, 0, rows, 0);
+    }
+    return std::move(out.result);
 }
 
 QueryResult sql_result(SqlReader& reader, Database& index, const std::vector<std::string>& symbols,

@@ -27,13 +27,6 @@ def test_projection_keeps_symbol_time_order_and_row_count(source):
     with pytest.raises(KeyError):
         quotes.read(symbol='missing', columns=['unknown'])
 
-    # 同一合约内部块时间重叠时自动在合约内按时间稳定归并
-    add_file(root, db, 'quotes', 'A', 20240102, [1, 2], ['10.5', '20.5'])
-    overlapped = quotes.read(symbol='A', columns=['time', 'value', 'symbol'])
-    assert overlapped['time'].cast(pa.int64()).to_pylist() == [0, 1, 2, 2, 3]
-    assert overlapped['value'].to_pylist() == [1.0, 10.5, 9e18, 20.5, 2.0]
-    assert overlapped['symbol'].to_pylist() == ['A'] * 5
-
 
 def test_projection_skips_unrequested_zstd_frame(source):
     root, db = source
