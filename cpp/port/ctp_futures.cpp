@@ -395,15 +395,15 @@ Json schema(const std::vector<Field>& fields,int64_t multiplier) {
     return result;
 }
 
-DecimalInteger decimal(View text,bool price) {
-    if (price && text.find_first_of(".eE")!=text.npos) {
+DecimalInteger decimal(View text) {
+    if (text.find_first_of(".eE")!=text.npos) {
         double number;
         auto [end,error]=std::from_chars(text.data(),text.data()+text.size(),number);
         if (end!=text.data()+text.size() || error!=std::errc{} || !std::isfinite(number))
-            throw std::runtime_error("无效价格："+std::string(text));
+            throw std::runtime_error("无效数值："+std::string(text));
         char buf[64];
         auto result=std::to_chars(buf,buf+sizeof buf,number,std::chars_format::general);
-        if (result.ec!=std::errc{}) throw std::runtime_error("无法转换价格");
+        if (result.ec!=std::errc{}) throw std::runtime_error("无法转换数值");
         return decimal_integer(View(buf,result.ptr));
     }
     return decimal_integer(text);
@@ -420,7 +420,7 @@ struct DayBlock {
                 col.data.push_back(i==1?day:integer(row.at(positions[i])));
                 continue;
             }
-            const auto n=decimal(row.at(positions[i]),fields[i].price);
+            const auto n=decimal(row.at(positions[i]));
             if (n.decimals>col.scale) {
                 for (auto& val:col.data) val=rescale(val,col.scale,n.decimals);
                 col.scale=n.decimals;
