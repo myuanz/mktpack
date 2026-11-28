@@ -78,4 +78,4 @@ just test
 
 ---
 
-[需求](https://github.com/myuanz/mktpack/blob/master/docs/%E9%9C%80%E6%B1%82.md) · [格式规范](https://github.com/myuanz/mktpack/blob/master/docs/%E8%A7%84%E8%8C%83.md)
+[需求](https://github.com/myuanz/mktpack/blob/master/docs/%E9%9C%80%E6%B1%82.md)
