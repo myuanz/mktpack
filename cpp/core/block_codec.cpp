@@ -220,7 +220,7 @@ void encode_block(Columns columns,Json schema,Json& header,std::vector<Bytes>& p
     }
 }
 
-Table decode_block(const Bytes& bytes,const Json& header,size_t offset,const Names* requested) {
+Table decode_block(ByteSpan bytes,const Json& header,size_t offset,const Names* requested) {
     const size_t rows=header.at("rows");
     struct Column {const Json& descriptor; size_t offset;};
     std::map<std::string,Column> available;
@@ -250,17 +250,18 @@ Table decode_block(const Bytes& bytes,const Json& header,size_t offset,const Nam
         for (auto k:{"prediction","scale_group"}) if (d.contains(k)) spec[k]=d.at(k);
         auto& values=table.columns[name];
         const int64_t first=d.at("first");
-        if (d.at("transform")=="constant") {
+        const auto& tf=d.at("transform").get_ref<const std::string&>();
+        if (tf=="constant") {
             values.assign(rows,first);
-        } else if (d.at("transform")=="changes") {
+        } else if (tf=="changes") {
             const size_t changes=d.at("changes");
             check(changes<rows && changes<=SIZE_MAX/2,"变更计数错误");
-            const auto stream=unpack(bytes,col.offset,d,2*changes);
+            const auto* stream=unpack_stream(bytes,col.offset,d,2*changes);
             const int64_t factor=d.at("factor");
             values.resize(rows);
             int64_t current=first;
             size_t previous=0;
-            for (size_t i=0;i<stream.size();i+=2) {
+            for (size_t i=0;i<2*changes;i+=2) {
                 const auto gap=stream[i];
                 check(gap && gap<rows-previous,"变更位置错误");
                 std::fill_n(values.begin()+previous,gap,current);
@@ -269,15 +270,22 @@ Table decode_block(const Bytes& bytes,const Json& header,size_t offset,const Nam
             }
             std::fill(values.begin()+previous,values.end(),current);
         } else {
-            auto stream=unpack(bytes,col.offset,d,rows);
+            const auto* stream=unpack_stream(bytes,col.offset,d,rows);
             const int64_t factor=d.at("factor");
             values.resize(rows);
             if (rows) values.front()=first;
-            for (size_t i=1;i<rows;++i) values[i]=checked(Wide(unzz(stream[i]))*factor);
+            if (factor==1) {
+                for (size_t i=1;i<rows;++i) values[i]=unzz(stream[i]);
+            } else {
+                for (size_t i=1;i<rows;++i) {
+                    if (__builtin_mul_overflow(unzz(stream[i]),factor,&values[i]))
+                        throw std::runtime_error("整数溢出");
+                }
+            }
         }
     }
-    struct Restore {Model model; Values& values;};
-    std::vector<Restore> restorers;
+    struct Restore {Model model; Values* values;};
+    std::vector<Restore> single_pass, quantity_pass;
     std::set<std::string> visiting,ordered;
     auto order=[&](auto&& self,const std::string& name)->void {
         if (ordered.contains(name)) return;
@@ -287,14 +295,55 @@ Table decode_block(const Bytes& bytes,const Json& header,size_t offset,const Nam
         visiting.erase(name);
         ordered.insert(name);
         auto m=model_for(name,d,table.columns,table.schema);
-        if (m.kind!=Transform::constant && m.kind!=Transform::direct && m.kind!=Transform::changes)
-            restorers.push_back({std::move(m),table.columns.at(name)});
+        if (m.kind==Transform::quantity) quantity_pass.push_back({std::move(m),&table.columns.at(name)});
+        else if (m.kind!=Transform::constant && m.kind!=Transform::direct && m.kind!=Transform::changes)
+            single_pass.push_back({std::move(m),&table.columns.at(name)});
     };
     for (const auto& name:needed) order(order,name);
-    for (size_t i=1;i<rows;++i) for (auto& [m,values]:restorers) {
-        Wide prediction,sum;
-        check(m.predict(i,prediction) && !__builtin_add_overflow(prediction,Wide(values[i]),&sum),"预测值溢出");
-        values[i]=checked(sum);
+
+    // 无列间依赖或仅单向列依赖的列，按依赖顺序逐列处理以便连续访存与向量化。
+    for (auto& [m,values_ptr]:single_pass) {
+        int64_t* dst=values_ptr->data();
+        if (m.kind==Transform::delta) {
+            int64_t acc=rows?dst[0]:0;
+            for (size_t i=1;i<rows;++i) {
+                if (__builtin_add_overflow(acc,dst[i],&acc)) throw std::runtime_error("预测值溢出");
+                dst[i]=acc;
+            }
+        } else if (m.kind==Transform::reference) {
+            const int64_t* ref=m.price->data();
+            for (size_t i=1;i<rows;++i) {
+                if (__builtin_add_overflow(ref[i],dst[i],&dst[i])) throw std::runtime_error("预测值溢出");
+            }
+        } else if (m.kind==Transform::amount) {
+            for (size_t i=1;i<rows;++i) {
+                Wide prediction,sum;
+                check(m.predict(i,prediction) && !__builtin_add_overflow(prediction,Wide(dst[i]),&sum),"预测值溢出");
+                dst[i]=checked(sum);
+            }
+        }
+    }
+    // 互相依赖对方上一行的列，按共享组归并后逐行共同推进。
+    std::vector<bool> done(quantity_pass.size(),false);
+    for (size_t g=0;g<quantity_pass.size();++g) {
+        if (done[g]) continue;
+        std::vector<Restore*> group_cols{&quantity_pass[g]};
+        done[g]=true;
+        const auto& base_qs=quantity_pass[g].model.quantities;
+        for (size_t k=g+1;k<quantity_pass.size();++k) {
+            if (!done[k] && quantity_pass[k].model.quantities==base_qs) {
+                group_cols.push_back(&quantity_pass[k]);
+                done[k]=true;
+            }
+        }
+        for (size_t i=1;i<rows;++i) {
+            for (auto* r:group_cols) {
+                Wide prediction,sum;
+                auto& dst=*r->values;
+                check(r->model.predict(i,prediction) && !__builtin_add_overflow(prediction,Wide(dst[i]),&sum),"预测值溢出");
+                dst[i]=checked(sum);
+            }
+        }
     }
     if (requested) for (const auto& name:needed) {
         if (std::find(requested->begin(),requested->end(),name)==requested->end()) {

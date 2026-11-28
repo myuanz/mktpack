@@ -65,26 +65,90 @@ std::pair<Bytes,Json> pack(const U& values) {
                     {"raw_size",use_bit?bit.size():byte.size()},{"size",result.size()}}};
 }
 
-U unpack(const Bytes& bytes, size_t offset, const Json& descriptor, size_t rows) {
+const uint64_t* unpack_stream(ByteSpan bytes, size_t offset, const Json& descriptor, size_t rows) {
     const size_t size=descriptor.at("size"),raw_size=descriptor.at("raw_size");
     const int bits=descriptor.at("bits"),mode=descriptor.at("mode");
     check(offset<=bytes.size() && size<=bytes.size()-offset,"载荷截断");
     check(bits>=1 && bits<=64 && (mode==0 || mode==1),"排列参数错误");
     check(raw_size==(mode==0?((rows+7)/8)*bits:rows*8),"原始长度错误");
-    Bytes raw(raw_size);
-    const auto size_read=ZSTD_decompress(raw.data(),raw.size(),bytes.data()+offset,size);
-    check(!ZSTD_isError(size_read) && size_read==raw.size(),"解压失败");
-    U output(rows);
+
+    struct Scratch {
+        struct FreeDCtx { void operator()(ZSTD_DCtx* ctx) const { ZSTD_freeDCtx(ctx); } };
+        std::unique_ptr<ZSTD_DCtx,FreeDCtx> dctx{ZSTD_createDCtx()};
+        std::unique_ptr<uint8_t[]> raw;
+        size_t raw_cap=0;
+        std::unique_ptr<uint64_t[]> out;
+        size_t out_cap=0;
+
+        uint8_t* ensure_raw(size_t n) {
+            if (n>raw_cap) { raw.reset(new uint8_t[n]); raw_cap=n; }
+            return raw.get();
+        }
+        uint64_t* ensure_out(size_t n) {
+            if (n>out_cap) { out.reset(new uint64_t[n]); out_cap=n; }
+            return out.get();
+        }
+    };
+    thread_local Scratch scratch;
+    check(bool(scratch.dctx),"无法创建解压上下文");
+    uint8_t* raw=scratch.ensure_raw(std::max<size_t>(1,raw_size));
+    const auto size_read=ZSTD_decompressDCtx(scratch.dctx.get(),raw,raw_size,bytes.data()+offset,size);
+    check(!ZSTD_isError(size_read) && size_read==raw_size,"解压失败");
+    uint64_t* output=scratch.ensure_out(std::max<size_t>(1,rows));
+    if (!rows) return output;
     if (mode==0) {
         const size_t plane=(rows+7)/8;
-        for (int b=0;b<bits;b+=8) for (size_t i=0;i<rows;i+=8) {
-            uint64_t matrix=0;
-            for (int k=0;k<std::min(8,bits-b);++k) matrix|=uint64_t(raw[(b+k)*plane+i/8])<<(8*k);
-            const auto transposed=transpose8(matrix);
-            for (size_t j=0;j<std::min<size_t>(8,rows-i);++j) output[i+j]|=((transposed>>(8*j))&255)<<b;
+        size_t i=0;
+        for (;i+8<=rows;i+=8) {
+            uint64_t acc[8]={};
+            for (int b=0;b<bits;b+=8) {
+                uint64_t matrix=0;
+                const int width=std::min(8,bits-b);
+                for (int k=0;k<width;++k) matrix|=uint64_t(raw[(b+k)*plane+i/8])<<(8*k);
+                const auto transposed=transpose8(matrix);
+                for (size_t j=0;j<8;++j) acc[j]|=((transposed>>(8*j))&255)<<b;
+            }
+            std::memcpy(output+i,acc,sizeof(acc));
+        }
+        if (i<rows) {
+            uint64_t acc[8]={};
+            for (int b=0;b<bits;b+=8) {
+                uint64_t matrix=0;
+                const int width=std::min(8,bits-b);
+                for (int k=0;k<width;++k) matrix|=uint64_t(raw[(b+k)*plane+i/8])<<(8*k);
+                const auto transposed=transpose8(matrix);
+                for (size_t j=0;j<rows-i;++j) acc[j]|=((transposed>>(8*j))&255)<<b;
+            }
+            std::memcpy(output+i,acc,(rows-i)*sizeof(uint64_t));
         }
     } else {
-        for (int b=0;b<8;++b) for (size_t i=0;i<rows;++i) output[i]|=uint64_t(raw[b*rows+i])<<(b*8);
+        const int active=(bits+7)/8;
+        if (active==1) {
+            for (size_t i=0;i<rows;++i) output[i]=raw[i];
+        } else if (active==2) {
+            const uint8_t* p0=raw;
+            const uint8_t* p1=raw+rows;
+            for (size_t i=0;i<rows;++i) output[i]=uint64_t(p0[i])|(uint64_t(p1[i])<<8);
+        } else if (active==3) {
+            const uint8_t* p0=raw;
+            const uint8_t* p1=raw+rows;
+            const uint8_t* p2=raw+2*rows;
+            for (size_t i=0;i<rows;++i) output[i]=uint64_t(p0[i])|(uint64_t(p1[i])<<8)|(uint64_t(p2[i])<<16);
+        } else if (active==4) {
+            const uint8_t* p0=raw;
+            const uint8_t* p1=raw+rows;
+            const uint8_t* p2=raw+2*rows;
+            const uint8_t* p3=raw+3*rows;
+            for (size_t i=0;i<rows;++i)
+                output[i]=uint64_t(p0[i])|(uint64_t(p1[i])<<8)|(uint64_t(p2[i])<<16)|(uint64_t(p3[i])<<24);
+        } else {
+            for (size_t i=0;i<rows;++i) output[i]=raw[i];
+            for (int b=1;b<active;++b) {
+                const uint8_t* plane_ptr=raw+size_t(b)*rows;
+                const int shift=b*8;
+                for (size_t i=0;i<rows;++i) output[i]|=uint64_t(plane_ptr[i])<<shift;
+            }
+        }
     }
     return output;
 }
@@ -101,7 +165,7 @@ Bytes load(const std::filesystem::path& path) {
 }
 
 const std::string magic("MKP\r\n\x1a\n\0",8);
-std::pair<Json,size_t> header(const Bytes& bytes) {
+std::pair<Json,size_t> header(ByteSpan bytes) {
     check(bytes.size()>=12 && std::equal(magic.begin(),magic.end(),bytes.begin()),"文件标识错误");
     uint32_t size=0;
     for (int i=0;i<4;++i) size|=uint32_t(bytes[8+i])<<(8*i);
@@ -274,7 +338,7 @@ static std::vector<uint8_t> encode_impl(Input&& input) {
 
 std::vector<uint8_t> encode(const Table& table) {return encode_impl(table);}
 std::vector<uint8_t> encode(Table&& table) {return encode_impl(std::move(table));}
-static Table decode_selected(const Bytes& bytes,const std::vector<std::string>* requested) {
+static Table decode_selected(ByteSpan bytes,const std::vector<std::string>* requested) {
     auto [description,offset]=header(bytes);
     if (description.value("codec","")=="predictive") return decode_block(bytes,description,offset,requested);
     const size_t rows=description.at("rows");
@@ -303,15 +367,18 @@ static Table decode_selected(const Bytes& bytes,const std::vector<std::string>* 
             offset+=size;
             continue;
         }
-        auto stream=unpack(bytes,offset,descriptor,rows);
+        const auto* stream=unpack_stream(bytes,offset,descriptor,rows);
         offset+=size_t(descriptor.at("size"));
         auto& values=table.columns[name];
         values.resize(rows);
         const bool ratio=descriptor.at("transform")=="ratio_1000";
-        for (size_t i=0;i<rows;++i) {
-            values[i]=ratio && !descriptor.at("centered").get<bool>()
-                ? static_cast<int64_t>(stream[i]) : unzz(stream[i]);
-            if (ratio && descriptor.at("centered").get<bool>()) values[i]+=500;
+        const bool centered=ratio && descriptor.at("centered").get<bool>();
+        if (ratio && !centered) {
+            for (size_t i=0;i<rows;++i) values[i]=static_cast<int64_t>(stream[i]);
+        } else if (centered) {
+            for (size_t i=0;i<rows;++i) values[i]=unzz(stream[i])+500;
+        } else {
+            for (size_t i=0;i<rows;++i) values[i]=unzz(stream[i]);
         }
         if (descriptor.at("transform")=="delta" && rows) {
             values.front()=descriptor.at("first");
@@ -339,7 +406,9 @@ static Table decode_selected(const Bytes& bytes,const std::vector<std::string>* 
     }
     for (auto& [name,values]:table.columns) {
         const int64_t factor=descriptors.at(name).at("factor");
-        for (auto& value:values) value=checked(__int128(value)*factor);
+        if (factor!=1) {
+            for (auto& value:values) value=checked(__int128(value)*factor);
+        }
     }
     for (const auto& [name,descriptor]:descriptors) {
         if (descriptor.at("transform")!="ratio_1000") continue;
@@ -353,6 +422,10 @@ static Table decode_selected(const Bytes& bytes,const std::vector<std::string>* 
         table.schema.erase(name);
     }
     return table;
+}
+Table decode(std::span<const uint8_t> bytes) { return decode_selected(bytes,nullptr); }
+Table decode(std::span<const uint8_t> bytes,const std::vector<std::string>& requested) {
+    return decode_selected(bytes,&requested);
 }
 Table decode(const Bytes& bytes) { return decode_selected(bytes,nullptr); }
 Table decode(const Bytes& bytes,const std::vector<std::string>& requested) {
