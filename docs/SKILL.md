@@ -64,9 +64,9 @@ ticks = tick.read(
 ```
 
 注意事项：
-- 返回 `pyarrow.Table`。时间戳为 `timestamp[ms, tz=UTC]`，精确数值为 `decimal128(38, scale)`，跨文件自动对齐到最高小数精度。
+- 返回 `pyarrow.Table`。时间戳为 `timestamp[ms, tz=UTC]`。
 - `start`/`end` 支持 `YYYYMMDD` 整数、UTC 毫秒整数、ISO 字符串、`date` 或 `datetime`；**无时区的 `datetime` 统一按 UTC 解释**，查询国内期货建议显式带 `+08:00`。
-- 结果按时间稳定排序，保留同一时间戳的原始行顺序；空结果仍保留完整 schema。
+- 结果按 `(symbol, time)` 稳定排序，空结果仍保留完整 schema。
 - 省略 `symbol`/`symbols` 时读取全部品种；省略 `start`/`end` 时不限时间范围。
 - 国内期货 `tick` 合约代码统一标准化为**全大写 + 4 位年月**（如 `RB2701`、`ZN2501`），不含交易所前缀且**严格区分大小写**（传小写如 `rb2701` 会返回空表）。
 - 国内期货 `tick` 包含 37 列（含五档买卖价量），`time` 为 UTC 毫秒、`trading_day` 为 `YYYYMMDD` 整数交易日，查询时按需传入 `columns` 可显著减少解码开销。
