@@ -1,9 +1,75 @@
 #pragma once
 #include <mktpack/core.hpp>
+#include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 namespace mktpack {
+// 支持无零初始化预分配的字节缓冲区，避免大结果集在单线程触发全量清零与软缺页。
+class EmptyBuffer {
+    std::unique_ptr<uint8_t[]> data_;
+    size_t size_ = 0;
+    size_t capacity_ = 0;
+
+    void grow(size_t needed) {
+        size_t next = capacity_ ? capacity_ * 2 : 64;
+        if (next < needed) next = needed;
+        auto fresh = std::make_unique_for_overwrite<uint8_t[]>(next);
+        if (size_) std::memcpy(fresh.get(), data_.get(), size_);
+        data_ = std::move(fresh);
+        capacity_ = next;
+    }
+public:
+    EmptyBuffer() = default;
+    EmptyBuffer(EmptyBuffer&& other) noexcept
+        : data_(std::move(other.data_)), size_(other.size_), capacity_(other.capacity_) {
+        other.size_ = other.capacity_ = 0;
+    }
+    EmptyBuffer& operator=(EmptyBuffer&& other) noexcept {
+        if (this != &other) {
+            data_ = std::move(other.data_);
+            size_ = other.size_;
+            capacity_ = other.capacity_;
+            other.size_ = other.capacity_ = 0;
+        }
+        return *this;
+    }
+    EmptyBuffer(const EmptyBuffer&) = delete;
+    EmptyBuffer& operator=(const EmptyBuffer&) = delete;
+
+    uint8_t* data() noexcept { return data_.get(); }
+    const uint8_t* data() const noexcept { return data_.get(); }
+    size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_ == 0; }
+    uint8_t& operator[](size_t index) noexcept { return data_[index]; }
+    const uint8_t& operator[](size_t index) const noexcept { return data_[index]; }
+
+    void reserve(size_t capacity) {
+        if (capacity > capacity_) grow(capacity);
+    }
+    void resize_for_overwrite(size_t size) {
+        if (size > capacity_) grow(size);
+        size_ = size;
+    }
+    void resize(size_t size, uint8_t fill = 0) {
+        const size_t old = size_;
+        resize_for_overwrite(size);
+        if (size > old) std::memset(data_.get() + old, fill, size - old);
+    }
+    void push_back(uint8_t byte) {
+        if (size_ == capacity_) grow(size_ + 1);
+        data_[size_++] = byte;
+    }
+    void append(const void* src, size_t length) {
+        if (!length) return;
+        const size_t offset = size_;
+        if (offset + length > capacity_) grow(offset + length);
+        std::memcpy(data_.get() + offset, src, length);
+        size_ = offset + length;
+    }
+};
+
 Json describe(const std::filesystem::path& root,const std::string& group="",const std::string& symbol="");
 std::vector<std::string> groups(const std::filesystem::path& root);
 std::optional<std::string> group_kind(const std::filesystem::path& root,const std::string& group);
@@ -16,7 +82,7 @@ struct ResultColumn {
     std::string type;
     int scale = 0;
     size_t rows = 0;
-    std::vector<std::vector<uint8_t>> buffers;
+    std::vector<EmptyBuffer> buffers;
     std::vector<ResultColumn> children;
 };
 struct QueryResult {

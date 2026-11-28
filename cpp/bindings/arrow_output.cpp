@@ -7,10 +7,10 @@
 namespace mktpack::bindings {
 namespace nb=nanobind;
 namespace {
-nb::object arrow_buffer(const nb::module_& pa,std::vector<uint8_t> values) {
-    auto data=std::make_unique<std::vector<uint8_t>>(std::move(values));
+nb::object arrow_buffer(const nb::module_& pa,EmptyBuffer values) {
+    auto data=std::make_unique<EmptyBuffer>(std::move(values));
     auto* ptr=data.get();
-    nb::capsule owner(ptr,[](void* p) noexcept {delete static_cast<std::vector<uint8_t>*>(p);});
+    nb::capsule owner(ptr,[](void* p) noexcept {delete static_cast<EmptyBuffer*>(p);});
     data.release();
     static const uint8_t empty=0;
     auto array=nb::cast(nb::ndarray<nb::numpy,const uint8_t>(ptr->empty()?&empty:ptr->data(),
