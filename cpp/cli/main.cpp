@@ -1,6 +1,7 @@
 #include <mktpack/binance.hpp>
 #include <mktpack/ctp_futures.hpp>
 #include <mktpack/storage.hpp>
+#include <mktpack/update.hpp>
 #include <CLI/CLI.hpp>
 #include <chrono>
 #include <cstdio>
@@ -27,10 +28,6 @@ struct ConsoleUtf8 {
     ~ConsoleUtf8() { SetConsoleOutputCP(out); SetConsoleCP(in); }
 };
 #endif
-
-std::filesystem::path utf8_path(const std::string& text) {
-    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()),text.size()));
-}
 
 std::string format_utc_ms(int64_t ms) {
     using namespace std::chrono;
@@ -110,7 +107,7 @@ int main(int argc, char** argv) {
     import_ticks->add_option("--readers",ctp_options.readers,"ZIP 读取线程数（默认 1）")->check(CLI::PositiveNumber);
     import_ticks->add_option("--profile",ctp_options.profile,"写入分阶段性能记录 JSON");
     auto packing=app.add_subcommand("package","打包为 SQLite 载荷分卷");
-    std::string destination, maximum="128MiB", package_start, package_end;
+    std::string destination, maximum="8GiB", package_start, package_end;
     mktpack::PackageOptions package_options;
     packing->add_option("destination",destination)->required();
     packing->add_option("--max-file-size",maximum,"每个分卷的实际文件大小上限");
@@ -119,20 +116,33 @@ int main(int argc, char** argv) {
     packing->add_option("--symbols",package_options.symbols)->expected(-1);
     packing->add_option("--start",package_start);
     packing->add_option("--end",package_end);
+    auto merging=app.add_subcommand("merge","通过本地发布 ZIP 或远端 manifest.json 升级数据集");
+    std::vector<std::string> merge_sources;
+    std::string merge_target_version;
+    mktpack::MergeOptions merge_options;
+    merging->add_option("sources",merge_sources,"一个或多个本地 .zip 更新包，或指向 manifest.json 的 http(s):// 文件地址")->required()->expected(-1);
+    merging->add_option("--groups",merge_options.groups,"仅合并指定数据组")->expected(-1);
+    merging->add_option("--symbols",merge_options.symbols,"仅合并指定品种")->expected(-1);
+    merging->add_option("--target-version",merge_target_version,"指定升级目标版本（默认 latest）");
+    auto compacting=app.add_subcommand("compact","归档热卷并优先封存至末尾冷卷");
+    std::string compact_maximum, compact_before;
+    mktpack::CompactOptions compact_options;
+    compacting->add_option("--max-file-size",compact_maximum,"每个分卷的实际文件大小上限（默认沿用 __meta__ 记录）");
+    compacting->add_option("--before",compact_before,"仅归档末时间早于该时间（UTC）的记录，其余保留在 hot.data.*");
     auto skill=app.add_subcommand("skill","输出或安装 MktPack Agent Skill");
     std::string skill_install;
     skill->add_option("--install",skill_install,"安装 SKILL.md 到指定目录或文件路径");
     try {
         app.parse(argc,app.ensure_utf8(argv));
         if (*info) {
-            const auto target=utf8_path(file);
+            const auto target=mktpack::utf8_path(file);
             if (std::filesystem::is_directory(target))
                 throw std::runtime_error("mkt info 仅用于单个 .mkp 文件；查看数据集请使用 mkt --root <目录> describe");
             std::cout << mktpack::info(target).dump(2) << "\n";
         } else if (*describe_cmd) {
             if (!describe_symbol.empty() && describe_group.empty())
                 throw std::runtime_error("指定 --symbol 时必须同时提供数据组名称");
-            auto result=mktpack::describe(utf8_path(root),describe_group,describe_symbol);
+            auto result=mktpack::describe(mktpack::utf8_path(root),describe_group,describe_symbol);
             if (result.is_object()) {
                 for (const auto* key:{"first_time","last_time"})
                     if (result.contains(key) && result[key].is_number_integer())
@@ -142,7 +152,7 @@ int main(int argc, char** argv) {
         } else if (*symbols_cmd) {
             const auto first=symbols_start.empty()?std::numeric_limits<int64_t>::min():mktpack::binance::timestamp(symbols_start);
             const auto last=symbols_end.empty()?std::numeric_limits<int64_t>::max():mktpack::binance::timestamp(symbols_end);
-            for (const auto& name:mktpack::symbols(utf8_path(root),symbols_group,first,last))
+            for (const auto& name:mktpack::symbols(mktpack::utf8_path(root),symbols_group,first,last))
                 std::cout << name << "\n";
         } else if (*download) {
             options.root=root;
@@ -166,6 +176,36 @@ int main(int argc, char** argv) {
             const auto result=mktpack::package(root,destination,package_options);
             for (const auto& warning:result.at("warnings")) std::cerr<<"警告："<<warning.get<std::string>()<<"\n";
             std::cout<<result.dump(2)<<"\n";
+        } else if (*merging) {
+            const auto target=mktpack::utf8_path(root);
+            merge_options.progress=[](const auto& message) { std::cerr<<message<<"\n"; };
+            mktpack::Json result;
+            const bool is_url=merge_sources.size()==1 &&
+                (merge_sources[0].starts_with("http://") || merge_sources[0].starts_with("https://"));
+            const bool all_zips=std::all_of(merge_sources.begin(),merge_sources.end(),[](const std::string& s) {
+                return s.size()>=4 && (s.ends_with(".zip") || s.ends_with(".ZIP"));
+            });
+            if (is_url) {
+                mktpack::update::Options opts{merge_options,merge_target_version,[](const auto& m){std::cerr<<m<<"\n";}};
+                result=mktpack::update::merge_remote(target,merge_sources[0],opts);
+            } else if (all_zips) {
+                std::vector<std::filesystem::path> zips;
+                zips.reserve(merge_sources.size());
+                for (const auto& s:merge_sources) zips.push_back(mktpack::utf8_path(s));
+                mktpack::update::Options opts{merge_options,merge_target_version,[](const auto& m){std::cerr<<m<<"\n";}};
+                result=mktpack::update::merge_zips(target,zips,opts);
+            } else {
+                throw std::runtime_error("mkt merge 仅支持本地 .zip 更新包或指向 manifest.json 的 http(s):// 地址");
+            }
+            if (result.contains("warnings"))
+                for (const auto& warning:result.at("warnings")) std::cerr<<"警告："<<warning.get<std::string>()<<"\n";
+            std::cout<<result.dump(2)<<"\n";
+        } else if (*compacting) {
+            if (!compact_maximum.empty()) compact_options.max_file_size=file_size(compact_maximum);
+            if (!compact_before.empty()) compact_options.before=mktpack::binance::timestamp(compact_before);
+            compact_options.progress=[](const auto& message) { std::cerr<<message<<"\n"; };
+            const auto result=mktpack::compact(mktpack::utf8_path(root),compact_options);
+            std::cout<<result.dump(2)<<"\n";
         } else if (*check || *check_ctp) {
             auto result=mktpack::check_dataset(root);
             std::cout << result.dump(2) << "\n";
@@ -174,12 +214,10 @@ int main(int argc, char** argv) {
             if (skill_install.empty()) {
                 std::cout << mktpack::cli::kSkillMarkdown;
             } else {
-                const auto target=skill_target(std::filesystem::path(
-                    std::u8string(reinterpret_cast<const char8_t*>(skill_install.data()),skill_install.size())));
+                const auto target=skill_target(mktpack::utf8_path(skill_install));
                 if (target.has_parent_path()) std::filesystem::create_directories(target.parent_path());
                 std::ofstream out(target,std::ios::binary|std::ios::trunc);
-                const auto u8=target.u8string();
-                const std::string display(reinterpret_cast<const char*>(u8.data()),u8.size());
+                const auto display=mktpack::utf8_string(target);
                 if (!out) throw std::runtime_error("无法写入："+display);
                 out.write(mktpack::cli::kSkillMarkdown.data(),static_cast<std::streamsize>(mktpack::cli::kSkillMarkdown.size()));
                 if (!out) throw std::runtime_error("写入失败："+display);
