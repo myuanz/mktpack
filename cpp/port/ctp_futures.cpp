@@ -1,6 +1,7 @@
 #include <mktpack/ctp_futures.hpp>
 #include <mktpack/decimal.hpp>
 #include "../storage/database.hpp"
+#include "../storage/store.hpp"
 #include <miniz.h>
 #include <algorithm>
 #include <array>
@@ -701,6 +702,7 @@ public:
 class TickWriter {
     struct Day {int period;const EncodedBlock* block;};
     Database& db;
+    storage::PayloadStore& store;
     Profile& profile;
     Stats& stats;
     const std::vector<Field>& names;
@@ -804,9 +806,34 @@ class TickWriter {
             });
         });
     }
+    void write_hot(std::span<const Day> days,std::span<const PreparedSource> sources,Stage stage) {
+        store.begin_hot_batch();
+        try {
+            transaction(stage,[&](Json& logical) {
+                for(const auto& [day,block]:days) {
+                    {
+                        auto timer=profile.scope(Stage::mkp_write);
+                        store.write_blob(group,"tick",symbol_id(block->symbol),block->symbol,
+                                         day,block->first,block->last,block->rows,block->bytes);
+                    }
+                    for(size_t i=0;i<names.size();++i) {
+                        auto& scale=logical.at(names[i].name).at("scale");
+                        if(block->scales[i]>scale.get<int>())scale=block->scales[i];
+                    }
+                    stats.rows+=block->rows;++stats.blocks;
+                    profile.count(Counter::rows,block->rows);profile.count(Counter::blocks);
+                }
+                for(const auto& source:sources)finish_source(source);
+                store.commit_hot_batch();
+            });
+        } catch(...) {
+            store.rollback_hot_batch();
+            throw;
+        }
+    }
 public:
-    TickWriter(Database& database,Profile& profiler,Stats& result,const std::vector<Field>& fields,bool complete)
-        :db(database),profile(profiler),stats(result),names(fields),group(storage::group_id(db,"tick")),complete_sources(complete) {
+    TickWriter(Database& database,storage::PayloadStore& payload_store,Profile& profiler,Stats& result,const std::vector<Field>& fields,bool complete)
+        :db(database),store(payload_store),profile(profiler),stats(result),names(fields),group(storage::group_id(db,"tick")),complete_sources(complete) {
         Json logical={{"symbol",{{"type","string"}}}};
         const auto specs=schema(names,0);
         for (const auto& [name,spec]:specs.items()) {
@@ -847,11 +874,20 @@ public:
         std::vector<Day> days;
         days.reserve(source.blocks.size());
         for(const auto& block:source.blocks)days.push_back({source.source.day,&block});
-        write_loose(days,std::span(&source,1),Stage::source_commit);
+        if(store.packed())write_hot(days,std::span(&source,1),Stage::source_commit);
+        else write_loose(days,std::span(&source,1),Stage::source_commit);
     }
     void write_year(std::span<const PreparedSource> sources,const Catalog& catalog,int today) {
         if(sources.empty())return;
         auto timer=profile.scope(Stage::bulk_total);
+        if(store.packed()) {
+            std::vector<Day> all_days;
+            for(const auto& source:sources) {
+                for(const auto& block:source.blocks)all_days.push_back({source.source.day,&block});
+            }
+            write_hot(all_days,sources,Stage::bulk_commit);
+            return;
+        }
         std::map<std::string,std::vector<Day>> volumes;
         std::vector<Day> loose;
         for(const auto& source:sources) {
@@ -1147,18 +1183,17 @@ static Json import_ticks_impl(const Options& options,Profile& profile) {
     std::unique_ptr<Database> database;
     {auto timer=profile.scope(Stage::index_open);database=std::make_unique<Database>(options.root,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);}
     auto& db=*database;
-    {
-        Statement check(db,"PRAGMA application_id");check.next();
-        if (check.integer(0)==0x4d4b5450) throw std::runtime_error("不能导入到已打包数据集");
-    }
+    storage::PayloadStore store(db);
     db.exec("PRAGMA journal_mode=MEMORY;PRAGMA synchronous=OFF;PRAGMA locking_mode=EXCLUSIVE;BEGIN EXCLUSIVE");
     storage::create_index(db);
+    storage::meta_set(db,"port","ctp-futures");
+    storage::ensure_default_version(db);
     db.exec("CREATE TABLE IF NOT EXISTS __ctp_futures_series__(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL);"
             "CREATE TABLE IF NOT EXISTS __ctp_futures_files__(series_id INTEGER,period INTEGER,PRIMARY KEY(series_id,period)) WITHOUT ROWID;"
             "CREATE INDEX IF NOT EXISTS __ctp_futures_loose__ ON __timefile__(group_id,period,symbol_id) WHERE volume_id IS NULL;");
     Stats stats;
     const auto names=fields();
-    TickWriter writer(db,profile,stats,names,symbols.empty());
+    TickWriter writer(db,store,profile,stats,names,symbols.empty());
     db.exec("COMMIT");
     const auto date=std::chrono::year_month_day{std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now()+std::chrono::hours(8))};
     const int today=int(date.year())*10000+int(unsigned(date.month()))*100+int(unsigned(date.day()));
@@ -1168,7 +1203,7 @@ static Json import_ticks_impl(const Options& options,Profile& profile) {
         SourceResults results(plan,*catalog,names,symbols,profile,options.jobs,options.readers);
         write_import(writer,plan,results,*catalog,today);
     }
-    if(!plan.backfill)compact_volumes(db,profile,*catalog,today);
+    if(!store.packed() && !plan.backfill)compact_volumes(db,profile,*catalog,today);
     return {{"imported",stats.imported},{"skipped",stats.skipped},{"blocks",stats.blocks},{"rows",stats.rows}};
 }
 

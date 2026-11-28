@@ -1,5 +1,6 @@
 #include <mktpack/binance.hpp>
 #include "../storage/sqlite.hpp"
+#include "../storage/store.hpp"
 #include <mktpack/decimal.hpp>
 #include <sqlite3.h>
 #include <miniz.h>
@@ -101,8 +102,9 @@ int64_t path_id(storage::Database& db,const std::string& path) {
 }
 
 struct DB:storage::Database {
-    explicit DB(const fs::path& path):Database(path,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE) {
-        if(fs::exists(root/"funding.sqlite")) attach_funding();
+    storage::PayloadStore store;
+    explicit DB(const fs::path& path):Database(path,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE),store(*this) {
+        if(!store.packed() && fs::exists(root/"funding.sqlite")) attach_funding();
     }
     void attach_funding() { exec("ATTACH DATABASE "+quote((root/"funding.sqlite").string())+" AS funding_data"); }
     int64_t file_id(const std::string& group,const std::string& symbol,int period) {
@@ -175,9 +177,9 @@ struct DB:storage::Database {
         const bool covered=sqlite3_column_int64(statement,3)>=required_end;
         int64_t missing=0;
         if (ready && verify_presence) {
-            const auto path=sqlite3_column_text(statement,2);
-            ready=path && fs::exists(root/(const char*)path);
-            if (!ready) missing=sqlite3_column_int64(statement,0);
+            const auto fid=sqlite3_column_int64(statement,0);
+            ready=store.exists(fid);
+            if (!ready) missing=fid;
         }
         sqlite3_finalize(statement);
         if (missing) {
@@ -293,78 +295,68 @@ Table csv(const std::string& text, const std::string& group, const std::string& 
     return table;
 }
 
-void register_file(DB& db, const fs::path& path, const Table& table) {
-    const auto& time=table.columns.at("time");
-    const auto symbol=table.metadata.at("symbol").get<std::string>();
-    const auto group=table.metadata.at("group").get<std::string>();
-    const auto stored=info(path);
-    Json schema=Json::object();
-    {
-        storage::Statement previous(db,"SELECT schema FROM __group__ WHERE name=?");
-        previous.text(1,group);
-        if (previous.next()) schema=Json::parse(previous.text(0));
-    }
+void update_group_schema(DB& db, const std::string& group, const std::vector<uint8_t>& bytes) {
+    const auto stored=info(bytes);
+    Json incoming=Json::object();
     for (const auto& descriptor:stored.at("columns")) {
-        const auto name=descriptor.at("name").get<std::string>();
-        const int old=schema.contains(name)?schema.at(name).value("scale",0):0;
-        schema[name]={{"type",descriptor.at("type")},{"scale",std::max(old,descriptor.value("scale",0))}};
+        incoming[descriptor.at("name").get<std::string>()]={
+            {"type",descriptor.at("type")},{"scale",descriptor.value("scale",0)}
+        };
     }
-    db.exec("INSERT INTO __group__(name,kind,schema) VALUES("+quote(group)+",'timeseries',"+quote(schema.dump())+") "
-            "ON CONFLICT(name) DO UPDATE SET schema=excluded.schema");
-    const auto group_key=storage::group_id(db,group), symbol_key=storage::symbol_id(db,symbol);
-    const auto period=std::stoi(path.stem().string());
-    db.exec("INSERT INTO __timefile__(group_id,symbol_id,period,first_time,last_time,rows) VALUES("+
-            std::to_string(group_key)+","+std::to_string(symbol_key)+","+std::to_string(period)+","+std::to_string(time.front())+","+
-            std::to_string(time.back())+","+std::to_string(time.size())+") "
-            "ON CONFLICT(group_id,symbol_id,period) DO UPDATE SET first_time=excluded.first_time,last_time=excluded.last_time,rows=excluded.rows");
+    storage::merge_group_schema(db,group,incoming);
 }
 
 void consolidate(DB& db, const Options& options, const std::string& group, const std::string& symbol,const Reporter& progress={}) {
-    const auto directory=options.root/group/symbol;
-    if (!fs::exists(directory)) return;
+    const auto group_key=storage::group_id(db,group), symbol_key=storage::symbol_id(db,symbol);
+    const auto entries=db.store.list(group_key,symbol_key);
+    if (entries.empty()) return;
     const auto today=floor<days>(system_clock::now());
-    std::map<std::string,std::vector<fs::path>> buckets;
-    for (const auto& entry:fs::directory_iterator(directory)) {
-        if (entry.path().extension()!=".mkp") continue;
-        const auto stem=entry.path().stem().string();
+    std::map<int,std::vector<storage::TimefileEntry>> buckets;
+    for (const auto& entry:entries) {
+        const auto stem=std::to_string(entry.period);
+        if (stem.size()<4) continue;
         const int year=std::stoi(stem.substr(0,4));
         if (sys_days{std::chrono::year{year+1}/1/1}<=today) {
-            buckets[stem.substr(0,4)].push_back(entry.path());
+            buckets[year].push_back(entry);
         } else if (stem.size()==8) {
             const auto month=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{timestamp(stem.substr(0,6)+"01")}})};
-            if (sys_days{month+months{1}}<=today) buckets[stem.substr(0,6)].push_back(entry.path());
+            if (sys_days{month+months{1}}<=today) buckets[std::stoi(stem.substr(0,6))].push_back(entry);
         }
     }
-    for (auto& [period,paths]:buckets) {
-        const auto destination=directory/(period+".mkp");
-        if (paths.size()==1 && paths.front()==destination) continue;
-        if(progress) progress("合并",period);
+    for (auto& [target_period,items]:buckets) {
+        if (items.size()==1 && items.front().period==target_period) continue;
+        if(progress) progress("合并",std::to_string(target_period));
         std::vector<Table> tables;
-        for (const auto& path:paths) tables.push_back(read(path));
+        tables.reserve(items.size());
+        for (const auto& item:items) tables.push_back(decode(db.store.read(item,group,symbol)));
         auto table=merge(tables);
         if (table.columns.contains("taker_buy_volume")) set_taker_encoding(table.schema,options.lossy_taker);
-        write(destination,table);
+        const auto& time=table.columns.at("time");
+        const auto bytes=encode(table);
+        std::vector<fs::path> deferred_unlink;
         db.exec("BEGIN IMMEDIATE");
-        register_file(db,destination,table);
-        const auto target=db.file_id(group,symbol,std::stoi(destination.stem().string()));
-        for (const auto& path:paths) {
-            if (path==destination) continue;
-            const auto old=db.file_id(group,symbol,std::stoi(path.stem().string()));
-            db.remap_file(old,target);
-            db.exec("DELETE FROM __timefile__ WHERE id="+std::to_string(old));
+        update_group_schema(db,group,bytes);
+        const auto target=db.store.write_blob(group_key,group,symbol_key,symbol,target_period,
+                                              time.front(),time.back(),static_cast<int64_t>(time.size()),bytes);
+        for (const auto& item:items) {
+            if (item.id==target) continue;
+            db.remap_file(item.id,target);
+            db.store.erase(item,group,symbol,&deferred_unlink);
         }
         db.exec("COMMIT");
-        for (const auto& path:paths) if (path!=destination) fs::remove(path);
+        for (const auto& path:deferred_unlink) {
+            std::error_code ec;
+            fs::remove(path,ec);
+        }
     }
 }
 
 void store_source(DB& db, const Options& options, const std::string& group,
                   const std::string& symbol, const std::string& period,
                   const Source& source_id, Table table, int64_t covered_until=0) {
-    const auto directory=options.root/group/symbol;
     auto local_period=period;
     local_period.erase(std::remove(local_period.begin(),local_period.end(),'-'),local_period.end());
-    auto destination=directory/(local_period+".mkp");
+    int target_period=std::stoi(local_period);
     const auto begin=timestamp(period.size()==7?period+"-01":period);
     const auto date=year_month_day{floor<days>(sys_time<milliseconds>{milliseconds{begin}})};
     const auto end=duration_cast<milliseconds>((period.size()==7?sys_days{date+months{1}}:sys_days{date}+days{1}).time_since_epoch()).count();
@@ -377,42 +369,48 @@ void store_source(DB& db, const Options& options, const std::string& group,
         db.exec("COMMIT");
         return;
     }
-    std::vector<fs::path> replaced;
-    std::vector<Table> tables{table};
-    if (fs::exists(directory)) {
-        for (const auto& entry:fs::directory_iterator(directory)) {
-            const auto path=entry.path();
-            if (path.extension()!=".mkp") continue;
-            const auto stem=path.stem().string();
-            if (stem==local_period || (stem.size()>local_period.size() && stem.starts_with(local_period))) {
-                replaced.push_back(path);
-            } else if (local_period.size()>stem.size() && local_period.starts_with(stem)) {
-                auto previous=read(path);
-                const auto& times=previous.columns.at("time");
-                const auto a=std::lower_bound(times.begin(),times.end(),begin)-times.begin();
-                const auto b=std::lower_bound(times.begin(),times.end(),end)-times.begin();
-                for (auto& [name,values]:previous.columns) values.erase(values.begin()+a,values.begin()+b);
-                tables.push_back(std::move(previous));
-                destination=path;
+    const auto group_key=storage::group_id(db,group), symbol_key=storage::symbol_id(db,symbol);
+    std::vector<storage::TimefileEntry> replaced;
+    std::vector<Table> tables{std::move(table)};
+    for (const auto& entry:db.store.list(group_key,symbol_key)) {
+        const auto stem=std::to_string(entry.period);
+        if (stem==local_period || (stem.size()>local_period.size() && stem.starts_with(local_period))) {
+            replaced.push_back(entry);
+        } else if (local_period.size()>stem.size() && local_period.starts_with(stem)) {
+            if (!db.store.exists(entry.id)) {
+                replaced.push_back(entry);
+                continue;
             }
+            auto previous=decode(db.store.read(entry,group,symbol));
+            const auto& times=previous.columns.at("time");
+            const auto a=std::lower_bound(times.begin(),times.end(),begin)-times.begin();
+            const auto b=std::lower_bound(times.begin(),times.end(),end)-times.begin();
+            for (auto& [name,values]:previous.columns) values.erase(values.begin()+a,values.begin()+b);
+            tables.push_back(std::move(previous));
+            target_period=entry.period;
         }
     }
     auto combined=merge(tables);
     if (combined.columns.contains("taker_buy_volume")) set_taker_encoding(combined.schema,options.lossy_taker);
-    write(destination,combined);
+    const auto& time=combined.columns.at("time");
+    const auto bytes=encode(combined);
+    std::vector<fs::path> deferred_unlink;
     db.exec("BEGIN IMMEDIATE");
-    register_file(db,destination,combined);
-    const auto target=db.file_id(group,symbol,std::stoi(destination.stem().string()));
-    for (const auto& path:replaced) {
-        if(path==destination) continue;
-        const auto old=db.file_id(group,symbol,std::stoi(path.stem().string()));
-        db.remap_file(old,target);
-        db.exec("DELETE FROM __timefile__ WHERE id="+std::to_string(old));
+    update_group_schema(db,group,bytes);
+    const auto target=db.store.write_blob(group_key,group,symbol_key,symbol,target_period,
+                                          time.front(),time.back(),static_cast<int64_t>(time.size()),bytes);
+    for (const auto& entry:replaced) {
+        if (entry.id==target) continue;
+        db.remap_file(entry.id,target);
+        db.store.erase(entry,group,symbol,&deferred_unlink);
     }
     db.exec("UPDATE "+source_id.table()+" SET file_id="+std::to_string(target)+",error=NULL"+
             (source_id.rest?",covered_until="+std::to_string(covered_until):"")+" WHERE "+source_id.condition());
     db.exec("COMMIT");
-    for(const auto& path:replaced) if(path!=destination) fs::remove(path);
+    for (const auto& path:deferred_unlink) {
+        std::error_code ec;
+        fs::remove(path,ec);
+    }
 }
 void funding_rest(DB& db, const Options& options, const std::string& symbol, int64_t begin,const Reporter& progress={}) {
     if (begin>=options.end) return;
@@ -628,19 +626,23 @@ void download(const Options& options) {
     fs::create_directories(options.root);
     {
         DB db(options.root/"mkt.sqlite");
-        sqlite3_stmt* packed=nullptr;
-        sqlite3_prepare_v2(db.db,"PRAGMA application_id",-1,&packed,nullptr);
-        const bool is_packed=sqlite3_step(packed)==SQLITE_ROW && sqlite3_column_int(packed,0)==0x4d4b5450;
-        sqlite3_finalize(packed);
-        if (is_packed) throw std::runtime_error("打包数据集不支持下载写入，请使用分散目录");
+        const bool is_packed=db.store.packed();
+        if (is_packed) {
+            if (std::find(options.groups.begin(),options.groups.end(),"funding_rate_settlement")!=options.groups.end()) {
+                // TODO: 支持向打包数据集写入 SQLite 时序组 funding_rate_settlement
+                throw std::runtime_error("暂不支持向打包数据集写入 SQLite 时序组 funding_rate_settlement");
+            }
+        }
         storage::create_index(db);
+        storage::meta_set(db,"port","binance");
+        storage::ensure_default_version(db);
         db.exec("PRAGMA journal_mode=DELETE;"
                 "CREATE TABLE IF NOT EXISTS __binance_datavision_paths__(id INTEGER PRIMARY KEY,parent_id INTEGER,name TEXT,UNIQUE(parent_id,name));CREATE TABLE IF NOT EXISTS __binance_datavision_templates__(id INTEGER PRIMARY KEY,path_id INTEGER,group_id INTEGER,symbol_id INTEGER,UNIQUE(path_id,group_id,symbol_id));"
                 "CREATE TABLE IF NOT EXISTS __binance_datavision_files__(template_id INTEGER,period INTEGER,file_id INTEGER,error TEXT,rows INTEGER,PRIMARY KEY(template_id,period)) WITHOUT ROWID;"
                 "CREATE INDEX IF NOT EXISTS __binance_datavision_files_file_id__ ON __binance_datavision_files__(file_id) WHERE file_id IS NOT NULL;"
                 "CREATE TABLE IF NOT EXISTS __binance_datavision_scans__(group_id INTEGER,symbol_id INTEGER,monthly INTEGER,start INTEGER,end INTEGER,PRIMARY KEY(group_id,symbol_id,monthly)) WITHOUT ROWID;"
                 "CREATE TABLE IF NOT EXISTS __binance_rest_funding__(symbol_id INTEGER,period INTEGER,rows INTEGER,error TEXT,covered_until INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(symbol_id,period)) WITHOUT ROWID;");
-        if(std::find(options.groups.begin(),options.groups.end(),"funding_rate_settlement")!=options.groups.end()) {
+        if(!is_packed && std::find(options.groups.begin(),options.groups.end(),"funding_rate_settlement")!=options.groups.end()) {
             if(!fs::exists(options.root/"funding.sqlite")) db.attach_funding();
             create_funding(db);
         }
