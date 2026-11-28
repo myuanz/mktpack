@@ -6,9 +6,9 @@ import sqlite3
 import subprocess
 import zipfile
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 import mktpack
@@ -78,11 +78,17 @@ def test_subset_incremental_tick_import_and_archive(tmp_path):
     assert table['volume'].to_pylist() == [1, 2, 0]
     assert table['bid_volume5'].to_pylist() == [6, 7, 5]
     assert table['trading_day'].to_pylist() == [20250401]*3
-    assert table['last_price'].to_pylist() == [Decimal('6241.8')]*3
-    assert table['turnover'].to_pylist() == [Decimal('4100000.000000001')]*3
-    assert table['open_interest'].to_pylist() == [Decimal('12.5')]*3
-    assert group.read(symbol='AP2510').num_rows == 1
+    assert table['last_price'].type == pa.float64()
+    assert table['last_price'].to_pylist() == [6241.8]*3
+    assert table['turnover'].to_pylist() == [4100000.000000001]*3
+    assert table['open_interest'].to_pylist() == [12.5]*3
+    full_ap2510 = group.read(symbol='AP2510')
+    assert full_ap2510.num_rows == 1
+    assert full_ap2510['symbol'].type == pa.dictionary(pa.int32(), pa.string())
     with sqlite3.connect(root/'mkt.sqlite') as db:
+        schema = json.loads(db.execute("SELECT schema FROM __group__ WHERE name='tick'").fetchone()[0])
+        assert schema['turnover'] == {'type': 'real', 'scale': 9}
+        assert schema['open_interest'] == {'type': 'real', 'scale': 1}
         assert db.execute("SELECT count(*) FROM sqlite_master WHERE name IN ('__ctp_futures_members__','__ctp_futures_loaded__')").fetchone()[0] == 0
         assert db.execute('SELECT period FROM __timefile__ ORDER BY period').fetchall() == [(20250401,), (20250401,)]
         assert db.execute('SELECT path FROM __volumes__').fetchall() == [('tick/AP2505/2025.data',), ('tick/AP2510/2025.data',)]
@@ -110,7 +116,7 @@ def test_retry_after_bad_source(tmp_path):
     runs = [cli(root, *args), cli(root, *args)]
     assert sorted(r['blocks'] for r in runs) == [0, 1]
     assert mktpack.open(root)['tick'].read(symbol='L2612F', columns=['last_price']).to_pydict() == {
-        'last_price': [Decimal('9851')],
+        'last_price': [9851.0],
     }
 
 

@@ -161,7 +161,7 @@ def test_package_volumes_repack_and_index_path(source, tmp_path):
     frames = payloads(destination)
     assert frames['kline/BTCUSDT/2024.mkp'] == (root / 'kline/BTCUSDT/2024.mkp').read_bytes()
     merged = mktpack.open(destination)['kline'].read(symbol='BTCUSDT', start='2025-01-01', end='2026-01-01')
-    assert merged['value'].to_pylist() == [Decimal('1.23'), Decimal('2.345'), Decimal('3.456')]
+    assert merged['value'].to_pylist() == [1.23, 2.345, 3.456]
     repacked = tmp_path / 'repacked'
     result2 = run_package(destination / 'mkt.sqlite', repacked, max_file_size=65536)
     assert result2['copied'] == 6 and result2['reencoded'] == 0
@@ -190,8 +190,8 @@ def test_filters_partial_year_precision_and_ordinary(source, tmp_path):
     narrow = tmp_path / 'narrow'
     run_package(destination, narrow, start='2025-02-01', end='2026-01-01')
     table = mktpack.open(narrow)['kline'].read()
-    assert table['value'].to_pylist() == [Decimal('2.345'), Decimal('3.456')]
-    assert table['value'].type.scale == 3
+    assert table['value'].to_pylist() == [2.345, 3.456]
+    assert table['value'].type == pa.float64()
     assert mktpack.open(narrow)['kline'].describe()['schema']['value']['scale'] == 3
     assert mktpack.open(narrow)['kline'].read(start='2026-01-01').num_rows == 0
 
@@ -309,7 +309,7 @@ def test_quantized_pack_preserves_values(source, tmp_path, mixed):
     run_package(root, destination, groups=['ratio'])
     actual = mktpack.open(destination)['ratio'].read()
     assert actual.equals(expected)
-    assert actual['taker_buy_volume'].to_pylist() == ([Decimal('.3334'), Decimal('.333')] if mixed else [Decimal('.333')]*2)
+    assert actual['taker_buy_volume'].to_pylist() == ([0.3334, 0.333] if mixed else [0.333]*2)
     rewritten = tmp_path / 'quantized-again'
     run_package(destination, rewritten)
     assert mktpack.open(rewritten)['ratio'].read().equals(expected)

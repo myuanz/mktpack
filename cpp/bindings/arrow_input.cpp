@@ -80,14 +80,14 @@ Json import_column(const nb::module_& pa, const nb::object& types, nb::object co
     if (nb::cast<int64_t>(column.attr("null_count")))
         throw std::invalid_argument("时序数值列不接受 null");
 
-    std::string kind = "decimal";
+    std::string kind = "real";
     int bits = 64, from = 0;
     bool floating = false, text = false;
     if (is("is_timestamp")) {
         kind = "timestamp";
         column = column.attr("cast")(pa.attr("timestamp")("ms","UTC"));
     } else if (is("is_integer")) {
-        kind = dictionary ? "decimal" : "integer";
+        kind = dictionary ? "real" : "integer";
         column = column.attr("cast")(pa.attr("int64")());
     } else if (is("is_decimal")) {
         bits = nb::cast<int>(type.attr("bit_width"));
@@ -173,8 +173,10 @@ Table table_from_arrow(nb::handle table, Json schema, Json metadata) {
         result.schema[name] = std::move(inferred);
     }
     if (!schema.empty()) {
-        for (const auto& [name, spec] : schema.items())
+        for (auto& [name, spec] : schema.items()) {
             if (!result.columns.contains(name)) throw nb::key_error(name.c_str());
+            if (spec.contains("type") && spec["type"] == "decimal") spec["type"] = "real";
+        }
         result.schema = std::move(schema);
     }
     return result;

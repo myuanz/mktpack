@@ -229,10 +229,10 @@ int main() {
         rest_options.start=begin; rest_options.end=timestamp("2024-02-01");
         download(rest_options);
         auto funding=mktpack::query(rest_options.root,"funding_rate_settlement",{"BTCUSDT"},begin,rest_options.end,std::vector<std::string>{"funding_rate"});
-        __int128 coefficients[2];
-        expect(funding.rows==2 && funding.columns.at(0).buffers.at(1).size()==sizeof(coefficients),"资金费率条数错误");
-        std::memcpy(coefficients,funding.columns[0].buffers[1].data(),sizeof(coefficients));
-        expect(coefficients[0]==12345 && coefficients[1]==-20000,"月归档未精确替换 REST 数据");
+        double rates[2];
+        expect(funding.rows==2 && funding.columns.at(0).buffers.at(1).size()==sizeof(rates),"资金费率条数错误");
+        std::memcpy(rates,funding.columns[0].buffers[1].data(),sizeof(rates));
+        expect(rates[0]==0.00012345 && rates[1]==-0.0002,"月归档未精确替换 REST 数据");
         auto before=requests;
         download(rest_options);
         expect(requests-before==1,"资金费率增量重复下载");

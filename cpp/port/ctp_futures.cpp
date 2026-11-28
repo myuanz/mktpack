@@ -374,7 +374,7 @@ Json schema(const std::vector<Field>& fields,int64_t multiplier) {
     Json result=Json::object();
     for (const auto& field:fields) {
         auto& spec=result[field.name];
-        spec={{"type",field.name=="time"?"timestamp":field.decimal?"decimal":"integer"},{"scale",0}};
+        spec={{"type",field.name=="time"?"timestamp":field.decimal?"real":"integer"},{"scale",0}};
         if (field.price) spec["scale_group"]="price";
     }
     auto& prediction=result["turnover"]["prediction"];

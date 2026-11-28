@@ -112,7 +112,7 @@ NB_MODULE(_native, module) {
             return mktpack::bindings::arrow_table(std::move(result));
         },nb::kw_only(),nb::arg("symbol")=nb::none(),nb::arg("symbols")=nb::none(),
           nb::arg("start")=nb::none(),nb::arg("end")=nb::none(),nb::arg("columns")=nb::none(),
-          "按合约、UTC [start, end) 时间区间与列投影读取时序数据，返回 pyarrow.Table。start/end 支持 YYYYMMDD 整数、UTC 毫秒整数、ISO 字符串、date 或 datetime（无时区按 UTC 解释）。");
+          "按合约、UTC [start, end) 时间区间与列投影读取时序数据，按 (symbol, time) 顺序返回 pyarrow.Table。start/end 支持 YYYYMMDD 整数、UTC 毫秒整数、ISO 字符串、date 或 datetime（无时区按 UTC 解释）。");
 
     nb::class_<Dataset>(module,"Dataset","MktPack 数据集入口，支持普通目录、打包目录和 mkt.sqlite 索引路径。")
         .def(nb::init<fs::path>(),nb::arg("root"))

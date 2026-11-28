@@ -7,6 +7,7 @@ import shutil
 import subprocess
 
 import mktpack
+import pyarrow as pa
 import pytest
 from test_package import source, run_package, check_package, milliseconds
 
@@ -29,7 +30,10 @@ def test_sqlite_query_and_package(source, tmp_path):
     db.commit()
     group = mktpack.open(root)['settlements']
     assert group.describe()['rows'] == 3
-    assert group.read(symbol='BTCUSDT')['rate'].to_pylist() == [Decimal('.0001'), Decimal('-.0123456789')]
+    assert group.read(symbol='BTCUSDT')['rate'].to_pylist() == [0.0001, -0.0123456789]
+    all_rows = group.read()
+    assert all_rows['symbol'].type == pa.dictionary(pa.int32(), pa.string())
+    assert all_rows['symbol'].to_pylist() == ['BTCUSDT', 'BTCUSDT', 'DOGEUSDT']
     assert group.read(start=20250101, end=20260101).num_rows == 2
     assert group.read(end=20250101).num_rows == 1
     assert group.read(symbol='missing').schema == group.read().schema
@@ -212,7 +216,7 @@ def test_sqlite_types_without_symbol_and_external_ordinary(source, tmp_path):
     assert original['payload'].to_pylist() == [b'\x00\xff', b'', None]
     assert original['mixed'].to_pylist() == [12, 'text', b'bytes']
     assert original['label'].to_pylist() == ['中文\x00文本', None, '']
-    assert original['exact'].to_pylist() == [Decimal('.0123'), None, Decimal('-.0003')]
+    assert original['exact'].to_pylist() == [0.0123, None, -0.0003]
     assert group.read(start=20300101).schema == original.schema
     with pytest.raises(RuntimeError, match='没有品种列'):
         group.read(symbol='BTCUSDT')
@@ -257,7 +261,7 @@ def test_sqlite_column_mapping_and_nullable_scale(source, tmp_path):
     db.execute("INSERT INTO __group__(name,kind,storage,location,table_name,time_column,symbol_column,schema) VALUES ('mapped','timeseries','sqlite','mapped.sqlite','table(quoted)','stamp','',?)", (json.dumps(schema),))
     db.commit()
     original = mktpack.open(root)['mapped'].read()
-    assert original['value'].to_pylist() == [Decimal('1.2'), None]
+    assert original['value'].to_pylist() == [1.2, None]
     destination = tmp_path / 'mapped'
     run_package(root, destination, groups=['mapped'])
     assert mktpack.open(destination)['mapped'].read().equals(original)

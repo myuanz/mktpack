@@ -30,7 +30,7 @@ std::string url_encode(const std::string& text,bool slash=false) {
 Json funding_schema(int scale) {
     return {{"time",{{"type","timestamp"},{"scale",0}}},
             {"symbol",{{"type","string"}}},
-            {"funding_rate",{{"type","decimal"},{"scale",scale},{"scale_column","scale"}}},
+            {"funding_rate",{{"type","real"},{"scale",scale},{"scale_column","scale"}}},
             {"interval_hours",{{"type","integer"},{"scale",0}}}};
 }
 
@@ -286,7 +286,7 @@ Table csv(const std::string& text, const std::string& group, const std::string& 
     for (const auto& [name,index]:fields) {
         int scale=0;
         for (const auto value:values[name]) scale=std::max(scale,value.decimals);
-        table.schema[name]={{"type",name=="interval_hours"?"integer":"decimal"},{"scale",scale}};
+        table.schema[name]={{"type",name=="interval_hours"?"integer":"real"},{"scale",scale}};
         auto& column=table.columns[name];
         for (const auto value:values[name]) column.push_back(rescale(value.value,value.decimals,scale));
     }

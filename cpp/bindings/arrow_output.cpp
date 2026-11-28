@@ -19,8 +19,17 @@ nb::object arrow_buffer(const nb::module_& pa,EmptyBuffer values) {
 }
 
 nb::object arrow_array(const nb::module_& pa,const nb::dict& types,ResultColumn column) {
-    auto type=column.type=="decimal"?pa.attr("decimal128")(38,column.scale)
-                                    :nb::borrow<nb::object>(types[nb::str(column.type.c_str())]);
+    if(column.type=="dictionary") {
+        nb::list buffers;
+        for(size_t i=0;i<column.buffers.size();++i) {
+            if(i==0 && column.buffers[i].empty())buffers.append(nb::none());
+            else buffers.append(arrow_buffer(pa,std::move(column.buffers[i])));
+        }
+        auto indices=pa.attr("Array").attr("from_buffers")(pa.attr("int32")(),column.rows,buffers);
+        auto values=arrow_array(pa,types,std::move(column.children.at(0)));
+        return pa.attr("DictionaryArray").attr("from_arrays")(indices,values);
+    }
+    auto type=nb::borrow<nb::object>(types[nb::str(column.type.c_str())]);
     nb::list buffers,children;
     for(size_t i=0;i<column.buffers.size();++i) {
         if(i==0 && column.buffers[i].empty())buffers.append(nb::none());

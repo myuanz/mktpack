@@ -159,6 +159,7 @@ void encode_block(Columns columns,Json schema,Json& header,std::vector<Bytes>& p
     const auto groups=normalize_prices(columns,schema);
     for (const auto& [name,values]:columns) {
         auto d=schema.at(name);
+        d["type"]=decimal_as_real(d.at("type").get<std::string>());
         d["name"]=name;
         d["first"]=values.empty()?0:values[0];
         if (std::adjacent_find(values.begin(),values.end(),std::not_equal_to<>())==values.end()) {
@@ -246,7 +247,7 @@ Table decode_block(ByteSpan bytes,const Json& header,size_t offset,const Names* 
         const auto& col=available.at(name);
         const auto& d=col.descriptor;
         auto& spec=table.schema[name];
-        spec={{"type",d.at("type")},{"scale",d.value("scale",0)}};
+        spec={{"type",decimal_as_real(d.at("type").get<std::string>())},{"scale",d.value("scale",0)}};
         for (auto k:{"prediction","scale_group"}) if (d.contains(k)) spec[k]=d.at(k);
         auto& values=table.columns[name];
         const int64_t first=d.at("first");

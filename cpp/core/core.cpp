@@ -14,6 +14,7 @@ void check(bool b,const char* m) { if(!b) throw std::runtime_error(m); }
 int64_t checked(__int128 v) { check(v>=INT64_MIN&&v<=INT64_MAX,"整数溢出"); return static_cast<int64_t>(v); }
 uint64_t zz(int64_t x) { return (uint64_t(x)<<1)^(x<0?UINT64_MAX:0); }
 int64_t unzz(uint64_t x) { return std::bit_cast<int64_t>((x>>1)^(uint64_t(0)-(x&1))); }
+std::string decimal_as_real(const std::string& type) { return type=="decimal"?"real":type; }
 Bytes compress(const Bytes& input) {
     struct FreeContext {void operator()(ZSTD_CCtx* context) const {ZSTD_freeCCtx(context);}};
     thread_local std::unique_ptr<ZSTD_CCtx,FreeContext> context(ZSTD_createCCtx());
@@ -223,7 +224,7 @@ static std::vector<uint8_t> encode_impl(Input&& input) {
         const int scale=spec.value("scale",0);
         check(scale>=0 && scale<=18,"小数位数必须在0至18之间");
         const auto type=spec.at("type").get<std::string>();
-        check(type=="timestamp" || type=="integer" || type=="decimal","不支持的数值列类型");
+        check(type=="timestamp" || type=="integer" || type=="real" || type=="decimal","不支持的数值列类型");
     }
     Json header={{"version",1},{"rows",rows},{"time_column","time"},
                  {"symbol",table.metadata.value("symbol","")},{"metadata",table.metadata},
@@ -262,6 +263,7 @@ static std::vector<uint8_t> encode_impl(Input&& input) {
     }
     for (const auto& [name,original]:table.columns) {
         Json descriptor=table.schema.at(name);
+        descriptor["type"]=decimal_as_real(descriptor.at("type").get<std::string>());
         descriptor["name"]=name;
         auto values=columns.at(name);
         uint64_t factor=1;
@@ -284,7 +286,7 @@ static std::vector<uint8_t> encode_impl(Input&& input) {
             auto [direct_bytes,direct_packing]=pack(direct);
             auto [centered_bytes,centered_packing]=pack(centered);
             const bool center=centered_bytes.size()<direct_bytes.size();
-            descriptor["type"]="decimal";
+            descriptor["type"]="real";
             descriptor["scale"]=volume_scale+3;
             check(volume_scale+3<=18,"比例恢复精度超出18位");
             descriptor["factor"]=1;
@@ -385,7 +387,7 @@ static Table decode_selected(ByteSpan bytes,const std::vector<std::string>* requ
             for (size_t i=1;i<rows;++i) values[i]=checked(__int128(values[i])+values[i-1]);
         }
         descriptors[name]=descriptor;
-        table.schema[name]={{"type",descriptor.at("type")},{"scale",descriptor.value("scale",0)}};
+        table.schema[name]={{"type",decimal_as_real(descriptor.at("type").get<std::string>())},{"scale",descriptor.value("scale",0)}};
         if (ratio) {
             table.schema[name]["encoding"]="ratio_1000";
             table.schema[name]["reference"]=descriptor.at("reference");
@@ -476,6 +478,8 @@ Table merge(const std::vector<Table>& inputs) {
             output.metadata["lossy_columns"].update(table.metadata.at("lossy_columns"));
         }
         for (auto& [name,schema]:output.schema.items()) {
+            schema["type"]=decimal_as_real(schema.at("type").get<std::string>());
+            if (decimal_as_real(table.schema.at(name).at("type").get<std::string>())=="real") schema["type"]="real";
             schema["scale"]=std::max(schema.value("scale",0),table.schema.at(name).value("scale",0));
             if (table.schema.at(name).value("encoding","")=="ratio_1000") {
                 schema["encoding"]="ratio_1000";

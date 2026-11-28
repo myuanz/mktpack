@@ -36,8 +36,9 @@ def test_query_scales_and_empty_schema(tmp_path):
         dataset['missing']
     group = dataset["oi"]
     result = group.read(symbol="BTCUSDT")
-    assert result["value"].type == pa.decimal128(38, 3)
-    assert result["value"].to_pylist() == [Decimal("1.200"), Decimal("2.345")]
+    assert result["value"].type == pa.float64()
+    assert result["symbol"].type == pa.dictionary(pa.int32(), pa.string())
+    assert result["value"].to_pylist() == [1.2, 2.345]
     assert group.read(symbol="BTCUSDT", start="2024-01-01").schema == result.schema
     assert group.read(columns=["value"]).column_names == ["value"]
     assert group.read(start=19700101, end=date(1970, 1, 2)).equals(result)
@@ -46,14 +47,23 @@ def test_query_scales_and_empty_schema(tmp_path):
 
     identifier = db.execute("SELECT id FROM __timefile__ WHERE period=1").fetchone()[0]
     volume = tmp_path / "absolute.data"
+    # 将 1.mkp 头部手动改写为存量 decimal 标签后再放入分卷，验证老分卷无缝兼容读取
+    raw_bytes = bytearray((tmp_path / "oi/BTCUSDT/1.mkp").read_bytes())
+    hlen = int.from_bytes(raw_bytes[8:12], "little")
+    hjson = json.loads(raw_bytes[12:12 + hlen])
+    for col in hjson["columns"]:
+        if col["name"] == "value":
+            col["type"] = "decimal"
+    new_hbytes = json.dumps(hjson).encode("utf-8")
+    legacy_mkp = bytes(raw_bytes[:8]) + len(new_hbytes).to_bytes(4, "little") + new_hbytes + bytes(raw_bytes[12 + hlen:])
     with sqlite3.connect(volume) as packed:
         packed.execute("CREATE TABLE blob(id INTEGER PRIMARY KEY,bytes BLOB NOT NULL)")
-        packed.execute("INSERT INTO blob VALUES(?,?)", (identifier, (tmp_path / "oi/BTCUSDT/1.mkp").read_bytes()))
+        packed.execute("INSERT INTO blob VALUES(?,?)", (identifier, legacy_mkp))
     db.execute("INSERT INTO __volumes__(path) VALUES(?)", (str(volume),))
     db.execute("UPDATE __timefile__ SET volume_id=(SELECT id FROM __volumes__ WHERE path=?) WHERE id=?", (str(volume), identifier))
     db.commit()
     (tmp_path / "oi/BTCUSDT/1.mkp").unlink()
-    assert group.read(symbol="BTCUSDT")["value"].to_pylist() == [Decimal("1.200"), Decimal("2.345")]
+    assert group.read(symbol="BTCUSDT")["value"].to_pylist() == [1.2, 2.345]
 
 
 def test_dataset_discovery_and_symbols(tmp_path):

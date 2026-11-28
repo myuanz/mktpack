@@ -11,6 +11,7 @@ void check(bool condition,const char* message);
 int64_t checked(__int128 value);
 uint64_t zz(int64_t value);
 int64_t unzz(uint64_t value);
+std::string decimal_as_real(const std::string& type);
 std::pair<Bytes,Json> pack(const U& values);
 const uint64_t* unpack_stream(ByteSpan bytes,size_t offset,const Json& descriptor,size_t rows);
 void encode_block(Columns columns,Json schema,Json& header,std::vector<Bytes>& payload);

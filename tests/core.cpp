@@ -21,7 +21,26 @@ int main() {
         table.schema[name]={{"type",name=="time"?"timestamp":"decimal"},{"scale",name=="time"?0:2}};
     }
     table.metadata={{"symbol","BTCUSDT"}};
-    expect(decode(encode(table)).columns==table.columns,"往返失败");
+    const auto encoded_table=encode(table);
+    expect(info(encoded_table)["columns"][0]["type"]=="real","新编码应将旧 decimal 升级为 real");
+    expect(decode(encoded_table).columns==table.columns,"往返失败");
+    // 构造存量 decimal 标签字节流，验证向后兼容解析
+    {
+        auto h=info(encoded_table);
+        for (auto& col:h["columns"]) if (col["type"]=="real") col["type"]="decimal";
+        const auto h_text=h.dump();
+        uint32_t old_len=0;
+        for (int i=0;i<4;++i) old_len|=uint32_t(encoded_table[8+i])<<(8*i);
+        std::vector<uint8_t> legacy;
+        legacy.reserve(12+h_text.size()+(encoded_table.size()-12-old_len));
+        legacy.insert(legacy.end(),encoded_table.begin(),encoded_table.begin()+8);
+        const uint32_t new_len=static_cast<uint32_t>(h_text.size());
+        for (int i=0;i<4;++i) legacy.push_back(uint8_t(new_len>>(8*i)));
+        legacy.insert(legacy.end(),h_text.begin(),h_text.end());
+        legacy.insert(legacy.end(),encoded_table.begin()+12+old_len,encoded_table.end());
+        expect(info(legacy)["columns"][0]["type"]=="decimal","未构造出存量 decimal 头部");
+        expect(decode(legacy).columns==table.columns,"存量 decimal 文件头解析失败");
+    }
     auto combined=merge({table,table});
     expect(combined.columns.at("time")==std::vector<int64_t>{1,1,1,1,3,3},"合并排序失败");
 
