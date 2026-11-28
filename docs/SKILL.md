@@ -71,14 +71,29 @@ ticks = tick.read(
 - 国内期货 `tick` 合约代码统一标准化为**全大写 + 4 位年月**（如 `RB2701`、`ZN2501`），不含交易所前缀且**严格区分大小写**（传小写如 `rb2701` 会返回空表）。
 - 国内期货 `tick` 包含 37 列（含五档买卖价量），`time` 为 UTC 毫秒、`trading_day` 为 `YYYYMMDD` 整数交易日，查询时按需传入 `columns` 可显著减少解码开销。
 
-### 3. 单文件调试接口
+### 3. 单文件调试与数据集维护接口
 
 ```python
+import mktpack
 from mktpack import raw
 
+# 单文件读写与头部检查
 file_info = raw.info("sample.mkp")  # 仅读取文件头（版本、行数、列编码与统计）
 table = raw.read("sample.mkp")
 raw.write("sample.mkp", table, schema=schema, metadata=metadata, lossy_taker=False)
+
+# 数据集元数据、校验、打包、增量升级与热卷归档
+mktpack.meta("data/binance")
+mktpack.set_meta("data/binance", "version", "2026.11.28")
+mktpack.check("data/binance")
+mktpack.package("data/binance", "packaged-data", max_file_size=8 * 1024**3)
+mktpack.merge_zips("packaged-data", ["2026.11.27_to_2026.11.28.zip"])
+mktpack.merge_remote("packaged-data", "https://bucket.example.com/ctp-futures/manifest.json")
+mktpack.compact("packaged-data", before="2026-01-01")
+
+# 数据源下载与导入
+mktpack.download_binance("data/binance", symbols=["BTCUSDT"], start="2026-01-01")
+mktpack.import_ctp_ticks("data/cn_futures", "ctp-mirror", start="20260101", end="20260201")
 ```
 
 ## 原生 CLI（`mkt`）
@@ -115,6 +130,13 @@ mkt --root data/binance symbols kline --start 2026-01-01 --end 2026-02-01
 
 # 将散文件或已有打包目录按容量重打包为 mkt.sqlite + mkt.data.N（目标目录必须为空）
 mkt --root data/binance package packaged-data --max-file-size 8GiB --groups kline --symbols BTCUSDT --start 2026-01-01 --end 2026-02-01 --jobs 4
+
+# 通过本地发布 zip 或远端 manifest.json 文件增量升级数据集
+mkt --root packaged-data merge 2026.11.27_to_2026.11.28.zip
+mkt --root packaged-data merge https://bucket.example.com/ctp-futures/manifest.json
+
+# 归档热卷（--before 之前的数据封存进末尾冷卷，其余留在 hot.data.1..M；默认沿用 __meta__ 中的分卷上限）
+mkt --root packaged-data compact --before 2026-01-01
 
 # 查看单个 .mkp 文件头 JSON
 mkt info data/binance/kline/BTCUSDT/2025.mkp

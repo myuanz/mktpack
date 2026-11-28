@@ -1,7 +1,13 @@
 #include <mktpack/core.hpp>
 #include <mktpack/storage.hpp>
+#ifdef MKTPACK_WITH_PORT
+#include <mktpack/binance.hpp>
+#include <mktpack/ctp_futures.hpp>
+#include <mktpack/update.hpp>
+#endif
 #include "arrow_input.hpp"
 #include "arrow_output.hpp"
+#include <chrono>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
@@ -183,4 +189,153 @@ NB_MODULE(_native, module) {
         nb::gil_scoped_release release;
         mktpack::merge_files({paths.begin(),paths.end()}, destination);
     });
+    module.def("meta", [](const fs::path& root) {
+        mktpack::Json result;
+        {
+            nb::gil_scoped_release release;
+            result=mktpack::dataset_meta(root);
+        }
+        return python_value(result);
+    },nb::arg("root"),"读取数据集 __meta__ 元数据字典。");
+    module.def("set_meta", [](const fs::path& root,const std::string& key,const std::string& value) {
+        nb::gil_scoped_release release;
+        mktpack::set_dataset_meta(root,key,value);
+    },nb::arg("root"),nb::arg("key"),nb::arg("value"),"写入数据集 __meta__ 键值元数据。");
+    module.def("merge_dataset", [](const fs::path& target,const fs::path& source,
+                                   std::optional<std::vector<std::string>> groups,
+                                   std::optional<std::vector<std::string>> symbols) {
+        mktpack::MergeOptions options;
+        if(groups)options.groups=std::move(*groups);
+        if(symbols)options.symbols=std::move(*symbols);
+        mktpack::Json result;
+        {
+            nb::gil_scoped_release release;
+            result=mktpack::merge_dataset(target,source,options);
+        }
+        return python_value(result);
+    },nb::arg("target"),nb::arg("source"),nb::kw_only(),nb::arg("groups")=nb::none(),nb::arg("symbols")=nb::none(),
+      "将源数据集的 MKP 载荷与普通表合入目标数据集。");
+    module.def("compact", [](const fs::path& root,std::optional<uint64_t> max_file_size,nb::object before) {
+        mktpack::CompactOptions options;
+        if(max_file_size)options.max_file_size=*max_file_size;
+        if(!before.is_none())options.before=timestamp(before,INT64_MAX);
+        mktpack::Json result;
+        {
+            nb::gil_scoped_release release;
+            result=mktpack::compact(root,options);
+        }
+        return python_value(result);
+    },nb::arg("root"),nb::kw_only(),nb::arg("max_file_size")=nb::none(),nb::arg("before")=nb::none(),
+      "整理打包数据集热卷并封存至末尾冷卷。");
+    module.def("check", [](const fs::path& root) {
+        mktpack::Json result;
+        {
+            nb::gil_scoped_release release;
+            result=mktpack::check_dataset(root);
+        }
+        return python_value(result);
+    },nb::arg("root"),"检查数据集索引与载荷完整性。");
+    module.def("package", [](const fs::path& source,const fs::path& destination,uint64_t max_file_size,
+                             std::optional<std::vector<std::string>> groups,
+                             std::optional<std::vector<std::string>> symbols,
+                             nb::object start,nb::object end,size_t jobs) {
+        mktpack::PackageOptions options;
+        options.max_file_size=max_file_size;
+        if(groups)options.groups=std::move(*groups);
+        if(symbols)options.symbols=std::move(*symbols);
+        options.start=timestamp(start,INT64_MIN);
+        options.end=timestamp(end,INT64_MAX);
+        options.jobs=jobs;
+        mktpack::Json result;
+        {
+            nb::gil_scoped_release release;
+            result=mktpack::package(source,destination,options);
+        }
+        return python_value(result);
+    },nb::arg("source"),nb::arg("destination"),nb::kw_only(),
+      nb::arg("max_file_size")=mktpack::default_max_file_size,nb::arg("groups")=nb::none(),nb::arg("symbols")=nb::none(),
+      nb::arg("start")=nb::none(),nb::arg("end")=nb::none(),nb::arg("jobs")=4,
+      "将数据集打包为 SQLite 分卷。");
+#ifdef MKTPACK_WITH_PORT
+    module.def("merge_zips", [](const fs::path& target,const std::vector<fs::path>& zip_paths,
+                                std::optional<std::vector<std::string>> groups,
+                                std::optional<std::vector<std::string>> symbols,
+                                std::string target_version) {
+        mktpack::update::Options options;
+        if(groups)options.merge.groups=std::move(*groups);
+        if(symbols)options.merge.symbols=std::move(*symbols);
+        options.target_version=std::move(target_version);
+        mktpack::Json result;
+        {
+            nb::gil_scoped_release release;
+            result=mktpack::update::merge_zips(target,zip_paths,options);
+        }
+        return python_value(result);
+    },nb::arg("target"),nb::arg("paths"),nb::kw_only(),
+      nb::arg("groups")=nb::none(),nb::arg("symbols")=nb::none(),nb::arg("target_version")="",
+      "通过一个或多个本地发布 ZIP 按版本链升级目标数据集。");
+    module.def("merge_remote", [](const fs::path& target,const std::string& url,
+                                  std::optional<std::vector<std::string>> groups,
+                                  std::optional<std::vector<std::string>> symbols,
+                                  std::string target_version) {
+        mktpack::update::Options options;
+        if(groups)options.merge.groups=std::move(*groups);
+        if(symbols)options.merge.symbols=std::move(*symbols);
+        options.target_version=std::move(target_version);
+        mktpack::Json result;
+        {
+            nb::gil_scoped_release release;
+            result=mktpack::update::merge_remote(target,url,options);
+        }
+        return python_value(result);
+    },nb::arg("target"),nb::arg("url"),nb::kw_only(),
+      nb::arg("groups")=nb::none(),nb::arg("symbols")=nb::none(),nb::arg("target_version")="",
+      "通过远端 manifest.json 文件地址按版本链流式下载并升级目标数据集。");
+    module.def("import_ctp_ticks", [](const fs::path& root,const fs::path& mirror,
+                                      std::string start,std::string end,
+                                      std::optional<std::vector<std::string>> symbols,
+                                      size_t jobs,size_t readers,std::optional<fs::path> profile) {
+        mktpack::ctp_futures::Options options;
+        options.root=root;
+        options.mirror=mirror;
+        options.start=std::move(start);
+        options.end=std::move(end);
+        if(symbols)options.symbols=std::move(*symbols);
+        options.jobs=jobs;
+        options.readers=readers;
+        if(profile)options.profile=std::move(*profile);
+        mktpack::Json result;
+        {
+            nb::gil_scoped_release release;
+            result=mktpack::ctp_futures::import_ticks(options);
+        }
+        return python_value(result);
+    },nb::arg("root"),nb::arg("mirror"),nb::kw_only(),
+      nb::arg("start")="",nb::arg("end")="",nb::arg("symbols")=nb::none(),
+      nb::arg("jobs")=16,nb::arg("readers")=1,nb::arg("profile")=nb::none(),
+      "导入国内期货镜像目录中的完整 CTP tick ZIP。");
+    module.def("download_binance", [](const fs::path& root,
+                                      std::optional<std::vector<std::string>> symbols,
+                                      std::optional<std::vector<std::string>> groups,
+                                      nb::object start,nb::object end,
+                                      size_t jobs,std::optional<fs::path> cache,bool full,bool lossy_taker) {
+        mktpack::binance::Options options;
+        options.root=root;
+        if(symbols)options.symbols=std::move(*symbols);
+        if(groups)options.groups=std::move(*groups);
+        options.start=timestamp(start,mktpack::binance::timestamp("2024-01-01"));
+        const auto today_ms=std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now()).time_since_epoch()).count();
+        options.end=timestamp(end,today_ms);
+        options.jobs=jobs;
+        if(cache)options.cache=std::move(*cache);
+        options.full=full;
+        options.lossy_taker=lossy_taker;
+        nb::gil_scoped_release release;
+        mktpack::binance::download(options);
+    },nb::arg("root"),nb::kw_only(),nb::arg("symbols")=nb::none(),nb::arg("groups")=nb::none(),
+      nb::arg("start")="2024-01-01",nb::arg("end")=nb::none(),nb::arg("jobs")=4,
+      nb::arg("cache")=nb::none(),nb::arg("full")=false,nb::arg("lossy_taker")=false,
+      "下载币安 USDT UM 永续行情、OI、资金费率或交易所信息。");
+#endif
 }
